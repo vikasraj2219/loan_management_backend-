@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 1 (Auth + Borrowers).** Loans, payments, interest automation, dashboard & reports come in later phases.
+> **Status: Phase 2 (Auth + Borrowers + Loans).** Payments, interest automation, dashboard & reports come in later phases.
 
 ## Tech Stack
 - Node.js + Express
@@ -48,7 +48,7 @@ npm run seed
 ```
 (Or just call `POST /auth/register` — the first user created automatically becomes admin.)
 
-## API Reference (Phase 1)
+## API Reference (Phase 2)
 
 Base URL: `http://localhost:5000/api/v1`
 
@@ -71,6 +71,18 @@ Base URL: `http://localhost:5000/api/v1`
 | DELETE | `/borrowers/:id` | Admin only | Deactivate (soft delete) |
 | POST | `/borrowers/:id/documents` | Authenticated | Upload KYC docs (multipart, field `documents`) |
 
+### Loans
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| GET | `/loans?status=&borrower=&minAmount=&maxAmount=&minRate=&maxRate=&page=&limit=` | Authenticated | List/filter/paginate loans (borrower populated) |
+| POST | `/loans` | Authenticated | Create a loan for an active borrower |
+| GET | `/loans/:id` | Authenticated | Get a single loan |
+| PATCH | `/loans/:id` | Authenticated | Update loan metadata (interest rate, tenure, due date, notes) — **not** principal |
+| PATCH | `/loans/:id/close` | Authenticated | Close a loan once `principalOutstanding` is 0 |
+| PATCH | `/loans/:id/mark-overdue` | Admin only | Manually flag a loan as overdue |
+
+**Loan logic**: `principalOutstanding` starts equal to `loanAmount` and is only ever reduced by recorded payments (Phase 3) — it's never editable directly via `PATCH`, so the audit trail always reconciles. `currentMonthlyInterest` is a virtual computed on demand as `principalOutstanding × interestRate / 100`, so it's always correct even if the rate or outstanding balance changes — nothing stale is stored.
+
 All protected routes need header: `Authorization: Bearer <accessToken>`
 
 ## Quick Test
@@ -88,11 +100,19 @@ curl -X POST http://localhost:5000/api/v1/borrowers \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <accessToken>" \
   -d '{"name":"Ravi Kumar","phone":"9876543210"}'
+# copy the borrower _id from the response
+
+curl -X POST http://localhost:5000/api/v1/loans \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <accessToken>" \
+  -d '{"borrower":"<borrowerId>","loanAmount":50000,"interestRate":2,"loanDate":"2026-01-01"}'
+
+curl "http://localhost:5000/api/v1/loans?status=active" \
+  -H "Authorization: Bearer <accessToken>"
 ```
 
 ## Roadmap
-- **Phase 2** — Loan model + CRUD, principal/interest tracking
-- **Phase 3** — Payments, automatic balance recalculation
+- **Phase 3** — Payment model, principal/interest payment recording, automatic recalculation of `principalOutstanding`, immutable payment history
 - **Phase 4** — Monthly interest cron job, dashboard, reports
 - **Phase 5+** — Frontend (React + Vite + MUI)
 

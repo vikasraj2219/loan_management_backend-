@@ -1,11 +1,11 @@
 const mongoose = require('mongoose');
 
 /**
- * NOTE: This is a Phase-1 placeholder so that Borrower virtual populate
- * and referential checks work end-to-end. Full loan/interest business
- * logic (principal tracking, interest generation, closure rules, etc.)
- * is implemented in Phase 2 — this schema will be extended there,
- * not replaced, so existing data remains compatible.
+ * Interest model used by this system: simple monthly interest calculated
+ * on the current outstanding principal (common for private/informal
+ * lending). Each month, interest due = principalOutstanding * (interestRate / 100).
+ * Interest does NOT compound into principal — it is tracked and collected
+ * separately (see Payment model, Phase 3).
  */
 const loanSchema = new mongoose.Schema(
   {
@@ -20,6 +20,9 @@ const loanSchema = new mongoose.Schema(
       required: [true, 'Loan amount is required'],
       min: [1, 'Loan amount must be greater than 0'],
     },
+    // Current remaining principal. Starts equal to loanAmount and is only
+    // ever reduced by recorded principal payments (Phase 3) — never edited
+    // directly, so the audit trail always reconciles.
     principalOutstanding: {
       type: Number,
       required: true,
@@ -30,11 +33,50 @@ const loanSchema = new mongoose.Schema(
       required: [true, 'Monthly interest rate is required'],
       min: 0,
     },
+    interestType: {
+      type: String,
+      enum: ['flat_monthly'], // reserved for future types (reducing, yearly, etc.)
+      default: 'flat_monthly',
+    },
+    loanDate: {
+      type: Date,
+      required: [true, 'Loan date is required'],
+      default: Date.now,
+    },
+    tenureMonths: {
+      type: Number,
+      min: 1,
+    },
+    dueDate: {
+      type: Date,
+    },
+    // Denormalized running totals, updated by the Payment module (Phase 3).
+    // Kept on the loan itself so list views never need to aggregate payments.
+    totalPrincipalPaid: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    totalInterestPaid: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    lastInterestGeneratedAt: {
+      type: Date,
+    },
     status: {
       type: String,
       enum: ['active', 'closed', 'overdue'],
       default: 'active',
       index: true,
+    },
+    closedAt: {
+      type: Date,
+    },
+    notes: {
+      type: String,
+      maxlength: [1000, 'Notes cannot exceed 1000 characters'],
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -45,5 +87,37 @@ const loanSchema = new mongoose.Schema(
 );
 
 loanSchema.index({ borrower: 1, status: 1 });
+loanSchema.index({ status: 1, dueDate: 1 });
+
+// Loan starts fully outstanding.
+loanSchema.pre('validate', function setInitialOutstanding(next) {
+  if (this.isNew && (this.principalOutstanding === undefined || this.principalOutstanding === null)) {
+    this.principalOutstanding = this.loanAmount;
+  }
+  next();
+});
+
+// Current month's interest due, computed on demand (not stored, so it's
+// always accurate even if interestRate or principalOutstanding changes).
+loanSchema.virtual('currentMonthlyInterest').get(function getCurrentMonthlyInterest() {
+  return Math.round((this.principalOutstanding * this.interestRate) / 100);
+});
+
+loanSchema.virtual('totalOutstanding').get(function getTotalOutstanding() {
+  // Principal still owed. Pending interest is tracked separately once
+  // monthly interest generation (Phase 4 cron) starts creating interest
+  // ledger entries; for now this reflects principal only.
+  return this.principalOutstanding;
+});
+
+// Payments belonging to this loan (Phase 3).
+loanSchema.virtual('payments', {
+  ref: 'Payment',
+  localField: '_id',
+  foreignField: 'loan',
+});
+
+loanSchema.set('toJSON', { virtuals: true });
+loanSchema.set('toObject', { virtuals: true });
 
 module.exports = mongoose.model('Loan', loanSchema);
