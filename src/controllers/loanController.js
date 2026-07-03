@@ -64,11 +64,9 @@ const getLoans = catchAsync(async (req, res) => {
  * @route GET /api/v1/loans/:id
  */
 const getLoanById = catchAsync(async (req, res) => {
-  const loan = await Loan.findById(req.params.id).populate({
-    path: 'borrower',
-    select: 'name phone email status',
-  });
-  // .populate('payments') will be enabled once the Payment model ships in Phase 3
+  const loan = await Loan.findById(req.params.id)
+    .populate({ path: 'borrower', select: 'name phone email status' })
+    .populate({ path: 'payments', options: { sort: { paymentDate: -1 } } });
 
   if (!loan) throw ApiError.notFound('Loan not found');
 

@@ -65,6 +65,9 @@ const loanSchema = new mongoose.Schema(
     lastInterestGeneratedAt: {
       type: Date,
     },
+    lastPaymentDate: {
+      type: Date,
+    },
     status: {
       type: String,
       enum: ['active', 'closed', 'overdue'],

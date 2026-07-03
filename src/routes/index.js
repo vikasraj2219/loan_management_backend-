@@ -2,6 +2,7 @@ const express = require('express');
 const authRoutes = require('./authRoutes');
 const borrowerRoutes = require('./borrowerRoutes');
 const loanRoutes = require('./loanRoutes');
+const paymentRoutes = require('./paymentRoutes');
 
 const router = express.Router();
 
@@ -12,8 +13,8 @@ router.get('/health', (req, res) => {
 router.use('/auth', authRoutes);
 router.use('/borrowers', borrowerRoutes);
 router.use('/loans', loanRoutes);
+router.use('/payments', paymentRoutes);
 
-// Phase 3 will add: router.use('/payments', paymentRoutes);
 // Phase 4 will add: router.use('/dashboard', dashboardRoutes); router.use('/reports', reportRoutes);
 
 module.exports = router;
