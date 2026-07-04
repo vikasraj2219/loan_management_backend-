@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 3 (Auth + Borrowers + Loans + Payments).** Interest automation, dashboard & reports come in Phase 4.
+> **Status: Phase 4 — feature-complete for a v1.** Auth, Borrowers, Loans, Payments, monthly interest automation, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -48,7 +48,7 @@ npm run seed
 ```
 (Or just call `POST /auth/register` — the first user created automatically becomes admin.)
 
-## API Reference (Phase 2)
+## API Reference (Phase 4)
 
 Base URL: `http://localhost:5000/api/v1`
 
@@ -96,6 +96,35 @@ Base URL: `http://localhost:5000/api/v1`
 
 All protected routes need header: `Authorization: Bearer <accessToken>`
 
+### Dashboard
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/dashboard/summary` | Borrower/loan counts, total lent, outstanding principal, pending interest, today's/monthly collection |
+| GET | `/dashboard/collection-trend?months=6` | Monthly collection totals, zero-filled for months with no activity |
+| GET | `/dashboard/principal-interest-trend?months=6` | Principal vs interest collected per month |
+| GET | `/dashboard/loan-status-distribution` | Active/closed/overdue counts + percentages |
+| GET | `/dashboard/recent-payments?limit=5` | Most recent payments, borrower populated |
+| GET | `/dashboard/overdue-loans?limit=5` | Overdue loans with computed `daysOverdue` |
+| GET | `/dashboard/top-borrowers?limit=5` | Ranked by total amount lent (aggregation pipeline) |
+
+### Reports
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/reports/collections?borrower=&loan=&dateFrom=&dateTo=` | JSON summary + full matching payment list |
+| GET | `/reports/export/csv?...` | Same filters, streamed as a `.csv` download |
+| GET | `/reports/export/excel?...` | Same filters, streamed as a formatted `.xlsx` workbook (summary + detail sheet) |
+| GET | `/reports/export/pdf?...` | Same filters, streamed as a paginated `.pdf` document |
+
+All three export formats and the JSON summary share one filter+fetch function (`fetchReportRows` in `reportController.js`), so a report and its export are always byte-for-byte consistent.
+
+### Jobs (monthly interest automation)
+| Method | Endpoint | Access | Description |
+|---|---|---|
+| POST | `/jobs/generate-interest` | Admin only | Manually run the monthly interest generation for the current period |
+| POST | `/jobs/check-overdue` | Admin only | Manually run the overdue-loan check |
+
+**How automation works**: `src/jobs/scheduler.js` registers a `node-cron` schedule (`INTEREST_CRON_DAY`/`INTEREST_CRON_HOUR` in `.env`, default: 1st of the month at 01:00) that calls `generateMonthlyInterest()` then `markOverdueLoans()` from `src/jobs/interestJob.js`. For every active/overdue loan, it creates an `InterestCharge` record (`principalOutstanding × interestRate / 100`) for the current `YYYY-MM` period and adds it to `Loan.totalInterestAccrued`. A unique index on `InterestCharge{loan, periodKey}` makes this **idempotent** — running it twice in the same month (via cron + a manual trigger, or after a missed tick) never double-charges a borrower; the second attempt is simply skipped. The `/jobs/*` endpoints exist so this can be exercised on demand instead of waiting for a real month to pass.
+
 ## Quick Test
 
 ```bash
@@ -129,6 +158,15 @@ curl -X POST http://localhost:5000/api/v1/payments \
 
 curl "http://localhost:5000/api/v1/payments?loan=<loanId>" \
   -H "Authorization: Bearer <accessToken>"
+
+curl -X POST http://localhost:5000/api/v1/jobs/generate-interest \
+  -H "Authorization: Bearer <accessToken>"
+
+curl "http://localhost:5000/api/v1/dashboard/summary" \
+  -H "Authorization: Bearer <accessToken>"
+
+curl "http://localhost:5000/api/v1/reports/export/csv" \
+  -H "Authorization: Bearer <accessToken>" -o report.csv
 ```
 
 Edge cases to verify:
@@ -136,10 +174,12 @@ Edge cases to verify:
 - Recording a payment against a `closed` loan → `400`
 - A payment with both `principalPaid` and `interestPaid` at 0 (or omitted) → `400`
 - After a payment, `GET /loans/:id` shows updated `principalOutstanding`, `totalPrincipalPaid`, `totalInterestPaid`, and the new payment appears in its `payments` list
+- Running `POST /jobs/generate-interest` twice in a row → second run reports `generated: 0, skipped: <n>` (idempotent, no double-charge)
+- `POST /jobs/generate-interest` / `check-overdue` as a non-admin → `403`
+- `GET /dashboard/summary` numbers reconcile with what you'd expect from the borrowers/loans/payments you created above
 
-## Roadmap
-- **Phase 4** — Monthly interest cron job, dashboard aggregation API, PDF/Excel/CSV report export
-- **Phase 5+** — Frontend (React + Vite + MUI)
+## This System Is Feature-Complete for a v1
+Every feature in the original brief is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, automatic monthly interest generation, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT

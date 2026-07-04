@@ -62,6 +62,14 @@ const loanSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    // Running total of every InterestCharge ever generated for this loan
+    // by the monthly cron job (Phase 4). pendingInterest = this minus
+    // totalInterestPaid — see the virtual below.
+    totalInterestAccrued: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     lastInterestGeneratedAt: {
       type: Date,
     },
@@ -106,11 +114,12 @@ loanSchema.virtual('currentMonthlyInterest').get(function getCurrentMonthlyInter
   return Math.round((this.principalOutstanding * this.interestRate) / 100);
 });
 
+loanSchema.virtual('pendingInterest').get(function getPendingInterest() {
+  return Math.max(this.totalInterestAccrued - this.totalInterestPaid, 0);
+});
+
 loanSchema.virtual('totalOutstanding').get(function getTotalOutstanding() {
-  // Principal still owed. Pending interest is tracked separately once
-  // monthly interest generation (Phase 4 cron) starts creating interest
-  // ledger entries; for now this reflects principal only.
-  return this.principalOutstanding;
+  return this.principalOutstanding + Math.max(this.totalInterestAccrued - this.totalInterestPaid, 0);
 });
 
 // Payments belonging to this loan (Phase 3).

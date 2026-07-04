@@ -3,6 +3,9 @@ const authRoutes = require('./authRoutes');
 const borrowerRoutes = require('./borrowerRoutes');
 const loanRoutes = require('./loanRoutes');
 const paymentRoutes = require('./paymentRoutes');
+const dashboardRoutes = require('./dashboardRoutes');
+const reportRoutes = require('./reportRoutes');
+const jobRoutes = require('./jobRoutes');
 
 const router = express.Router();
 
@@ -14,7 +17,8 @@ router.use('/auth', authRoutes);
 router.use('/borrowers', borrowerRoutes);
 router.use('/loans', loanRoutes);
 router.use('/payments', paymentRoutes);
-
-// Phase 4 will add: router.use('/dashboard', dashboardRoutes); router.use('/reports', reportRoutes);
+router.use('/dashboard', dashboardRoutes);
+router.use('/reports', reportRoutes);
+router.use('/jobs', jobRoutes);
 
 module.exports = router;
