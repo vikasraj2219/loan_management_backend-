@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 + Pending Monthly Interest Tracking.** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with FIFO payment allocation, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill.** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with FIFO payment allocation, an on-demand backfill/recovery generator, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -137,9 +137,33 @@ This is the core domain model of the system, so it's worth explaining in full.
 
 **Generation happens on each loan's own "money taken day".** Rather than one fixed date for the whole system, `src/jobs/interestJob.js` runs a check **daily** (`src/jobs/scheduler.js`, `INTEREST_CRON_HOUR` in `.env`) and, for every active/overdue loan, asks: *is today this loan's billing anniversary — the day-of-month it was disbursed?* If so, and no record exists yet for the current month, it generates one (`principalOutstanding × interestRate / 100`, clamped for short months so a loan disbursed on the 31st still bills on the 28th/30th). The loan's **first** month is generated immediately at loan creation (`ensureFirstMonthInterest`, called from `loanController.createLoan`) rather than waiting for a cron tick, since the brief's example table starts counting from the disbursal month. A unique index on `(loan, year, month)` makes every generation idempotent.
 
-**Payments always clear the oldest unpaid month first — FIFO, no exceptions.** `paymentController.allocateInterestFifo` walks a loan's pending `MonthlyInterest` records oldest-first and applies the payment's `interestPaid` across as many as it covers, exactly like the brief's example (Feb + Mar + Apr pending, borrower pays enough for two → Feb and Mar become `paid`, Apr stays `pending`). There is no API for picking which month a payment clears — that's a deliberate constraint, not an oversight. Every allocation is recorded on the `Payment` document itself (`interestAllocations: [{ monthlyInterest, month, year, amountApplied }]`) as a permanent audit trail back to exactly which months a given payment touched.
+**Payments always clear the oldest unpaid month first — FIFO, no exceptions.** `allocateInterestFifo` (in `src/services/interestAllocationService.js`, shared by payment recording and the backfill reconciliation below) walks a loan's pending `MonthlyInterest` records oldest-first and applies the payment's `interestPaid` across as many as it covers, exactly like the brief's example (Feb + Mar + Apr pending, borrower pays enough for two → Feb and Mar become `paid`, Apr stays `pending`). There is no API for picking which month a payment clears — that's a deliberate constraint, not an oversight. Every allocation is recorded on the `Payment` document itself (`interestAllocations: [{ monthlyInterest, month, year, amountApplied }]`) as a permanent audit trail back to exactly which months a given payment touched.
 
 **Everything is computed live, nothing is trusted from a cache.** Dashboard cards, the borrower's Interest Summary, a loan's Interest Schedule, and every pending/overdue interest report all query `MonthlyInterest` directly at request time. (`Loan.totalInterestAccrued`/`totalInterestPaid` still exist as fast denormalized figures for list views, but they're a convenience, not the source of truth.)
+
+### Manual backfill / recovery: `POST /interest/generate`
+
+The daily cron only ever generates *today's* billing charge for loans whose anniversary is today. That's a problem for loans that existed before this feature shipped, data migrated from elsewhere, or any stretch of time the cron didn't run — their Interest Summary reads all zeros not because nothing is owed, but because no `MonthlyInterest` records exist yet to say so.
+
+`POST /interest/generate` (admin only) fixes that on demand:
+
+```json
+{ "loanId": "optional", "borrowerId": "optional", "generateTill": "optional ISO date, defaults to now" }
+```
+
+- No body fields → runs across every active/overdue loan in the system.
+- `borrowerId` → scoped to just that borrower's loans.
+- `loanId` → scoped to just that one loan.
+- For each targeted loan, it walks every billing period from `loanDate` up to `generateTill` and creates whichever ones don't already exist — never touching, merging, or duplicating an existing month. It's checked directly (`MonthlyInterest.exists(...)`) rather than relying solely on the unique index, so the response's `duplicatesSkipped` count is exact.
+- **Reconciliation step**: if any records were created for a loan, it then re-sweeps that loan's payments (oldest first) that still have leftover `unallocatedInterest` — money paid toward interest before any month existed to absorb it — and re-applies it FIFO against the months that were just backfilled. This is what actually fixes a loan like the one in the bug report: a payment recorded against an empty interest schedule no longer stays permanently stranded once the missing months show up.
+
+Response shape:
+
+```json
+{ "totalLoans": 58, "recordsCreated": 412, "duplicatesSkipped": 389, "failed": 0, "interestReconciled": 4200, "errors": [] }
+```
+
+Safe to run as often as you like — a second run over the same range reports `recordsCreated: 0` and everything as `duplicatesSkipped`.
 
 ## Quick Test
 
@@ -192,6 +216,19 @@ curl "http://localhost:5000/api/v1/reports/pending-interest" \
 
 curl "http://localhost:5000/api/v1/reports/overdue-interest" \
   -H "Authorization: Bearer <accessToken>"
+
+# Backfill every missing month for one loan (e.g. a loan created before
+# this feature existed, exactly the scenario in the bug report)
+curl -X POST http://localhost:5000/api/v1/interest/generate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <accessToken>" \
+  -d '{"loanId":"<loanId>"}'
+
+# Backfill everything, system-wide, up to a specific date
+curl -X POST http://localhost:5000/api/v1/interest/generate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <accessToken>" \
+  -d '{"generateTill":"2026-07-01"}'
 ```
 
 Edge cases to verify:
@@ -206,9 +243,12 @@ Edge cases to verify:
 - Create three months of pending interest (e.g. by backdating test data or waiting for cron ticks), then pay an amount covering exactly two months' worth of interest → the two oldest months become `paid`, the third stays `pending` (FIFO)
 - Pay more interest than is currently pending across all months → the excess shows up as `unallocatedInterest` on the `Payment`, not silently dropped
 - A `MonthlyInterest` whose `dueDate` has passed and is still unpaid → counted in `/dashboard/summary`'s `overdueInterestAmount` and shows up in `/reports/overdue-interest`
+- **The bug-report scenario**: create a loan, record a payment with `interestPaid > 0` *before* any `MonthlyInterest` record exists for it (simulating a pre-existing loan) → the payment's entire `interestPaid` sits as `unallocatedInterest`. Then run `POST /interest/generate` for that loan → the missing months appear as `pending`/`paid` correctly, and the old payment's `unallocatedInterest` drops (or hits 0) as it gets retroactively applied — `interestReconciled` in the response reflects exactly how much moved
+- Run `POST /interest/generate` twice in a row for the same loan → second run reports `recordsCreated: 0`, everything as `duplicatesSkipped`, and `interestReconciled: 0` (nothing left to reconcile)
+- `POST /interest/generate` as a non-admin → `403`
 
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief plus the Pending Monthly Interest Tracking addendum is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, per-loan monthly interest generation on each borrower's own billing day, FIFO interest payment allocation, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking and Manual Interest Backfill addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, per-loan monthly interest generation on each borrower's own billing day, FIFO interest payment allocation, on-demand backfill for pre-existing data, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT

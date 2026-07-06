@@ -6,6 +6,7 @@ const paymentRoutes = require('./paymentRoutes');
 const dashboardRoutes = require('./dashboardRoutes');
 const reportRoutes = require('./reportRoutes');
 const jobRoutes = require('./jobRoutes');
+const interestRoutes = require('./interestRoutes');
 
 const router = express.Router();
 
@@ -20,5 +21,6 @@ router.use('/payments', paymentRoutes);
 router.use('/dashboard', dashboardRoutes);
 router.use('/reports', reportRoutes);
 router.use('/jobs', jobRoutes);
+router.use('/interest', interestRoutes);
 
 module.exports = router;
