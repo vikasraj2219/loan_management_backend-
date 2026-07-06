@@ -4,26 +4,78 @@ const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
 const Payment = require('../models/Payment');
 const Loan = require('../models/Loan');
+const MonthlyInterest = require('../models/MonthlyInterest');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
 
 /**
+ * Applies `interestAmount` to a loan's pending MonthlyInterest records,
+ * oldest month first (FIFO) — this is the only allocation rule in the
+ * system; there is no way for a user to pick which month a payment clears.
+ * Returns { allocations, unallocated } where `allocations` records exactly
+ * how much went to which month (for the Payment's audit trail) and
+ * `unallocated` is whatever didn't fit into any pending month.
+ */
+async function allocateInterestFifo(loanId, interestAmount, paidOn, session) {
+  const allocations = [];
+  let remaining = interestAmount;
+
+  if (remaining <= 0) return { allocations, unallocated: 0 };
+
+  const pendingMonths = await MonthlyInterest.find({
+    loan: loanId,
+    status: { $in: ['pending', 'partially_paid'] },
+  })
+    .sort({ year: 1, month: 1 }) // oldest first — FIFO
+    .session(session || null);
+
+  for (const monthRecord of pendingMonths) {
+    if (remaining <= 0) break;
+
+    const before = monthRecord.pendingAmount;
+    if (before <= 0) continue;
+
+    const applied = Math.min(remaining, before);
+    monthRecord.paidAmount += applied;
+    // pendingAmount/status/paidDate are recalculated by the model's
+    // pre('save') hook from interestAmount - paidAmount — never set directly.
+    // eslint-disable-next-line no-await-in-loop
+    await monthRecord.save({ session });
+
+    allocations.push({
+      monthlyInterest: monthRecord._id,
+      month: monthRecord.month,
+      year: monthRecord.year,
+      amountApplied: applied,
+    });
+
+    remaining -= applied;
+  }
+
+  return { allocations, unallocated: remaining };
+}
+
+/**
  * @desc  Record a payment (principal and/or interest) against a loan.
- *        This is the only way a loan's principalOutstanding ever changes —
- *        it is never edited directly via the Loan API.
+ *        This is the only way a loan's principalOutstanding ever changes,
+ *        and the only way any MonthlyInterest record's paidAmount changes
+ *        — interest is always applied oldest-month-first (FIFO), never to
+ *        a month the caller picks.
  * @route POST /api/v1/payments
  *
- * NOTE ON CONSISTENCY: ideally this runs inside a MongoDB transaction so the
- * Payment insert and Loan update commit atomically. Transactions require a
- * replica-set deployment; a standalone `mongod` (common in local dev) does
- * not support them. This code opportunistically uses a transaction when the
- * connection supports it, and falls back to sequential writes otherwise —
- * documented here rather than hidden, since it's the one place in this
- * codebase where a partial failure could leave data slightly inconsistent.
+ * NOTE ON CONSISTENCY: ideally this runs inside a MongoDB transaction so
+ * the Payment insert, Loan update, and every MonthlyInterest update commit
+ * atomically. Transactions require a replica-set deployment; a standalone
+ * `mongod` (common in local dev) does not support them. This code
+ * opportunistically uses a transaction when the connection supports it,
+ * and falls back to sequential writes otherwise — documented here rather
+ * than hidden, since it's the one place in this codebase where a partial
+ * failure could leave data slightly inconsistent.
  */
 const createPayment = catchAsync(async (req, res) => {
   const { loan: loanId, paymentDate, paymentMode, referenceNumber, remarks } = req.body;
   const principalPaid = Number(req.body.principalPaid) || 0;
   const interestPaid = Number(req.body.interestPaid) || 0;
+  const effectiveDate = paymentDate || Date.now();
 
   const loan = await Loan.findById(loanId);
   if (!loan) throw ApiError.notFound('Loan not found');
@@ -40,27 +92,28 @@ const createPayment = catchAsync(async (req, res) => {
 
   const newOutstanding = loan.principalOutstanding - principalPaid;
 
+  const buildPaymentDoc = (allocationResult) => ({
+    loan: loan._id,
+    borrower: loan.borrower,
+    paymentDate: effectiveDate,
+    principalPaid,
+    interestPaid,
+    paymentMode,
+    referenceNumber,
+    remarks,
+    principalOutstandingAfter: newOutstanding,
+    interestAllocations: allocationResult.allocations,
+    unallocatedInterest: allocationResult.unallocated,
+    recordedBy: req.user._id,
+  });
+
   const session = await mongoose.startSession();
   let payment;
   try {
     await session.withTransaction(async () => {
-      const [created] = await Payment.create(
-        [
-          {
-            loan: loan._id,
-            borrower: loan.borrower,
-            paymentDate: paymentDate || Date.now(),
-            principalPaid,
-            interestPaid,
-            paymentMode,
-            referenceNumber,
-            remarks,
-            principalOutstandingAfter: newOutstanding,
-            recordedBy: req.user._id,
-          },
-        ],
-        { session }
-      );
+      const allocationResult = await allocateInterestFifo(loan._id, interestPaid, effectiveDate, session);
+
+      const [created] = await Payment.create([buildPaymentDoc(allocationResult)], { session });
       payment = created;
 
       loan.principalOutstanding = newOutstanding;
@@ -73,18 +126,9 @@ const createPayment = catchAsync(async (req, res) => {
     // Standalone MongoDB (no replica set) throws here because transactions
     // aren't supported — fall back to sequential writes.
     if (err.message?.includes('Transaction numbers') || err.codeName === 'IllegalOperation') {
-      payment = await Payment.create({
-        loan: loan._id,
-        borrower: loan.borrower,
-        paymentDate: paymentDate || Date.now(),
-        principalPaid,
-        interestPaid,
-        paymentMode,
-        referenceNumber,
-        remarks,
-        principalOutstandingAfter: newOutstanding,
-        recordedBy: req.user._id,
-      });
+      const allocationResult = await allocateInterestFifo(loan._id, interestPaid, effectiveDate, null);
+
+      payment = await Payment.create(buildPaymentDoc(allocationResult));
 
       loan.principalOutstanding = newOutstanding;
       loan.totalPrincipalPaid += principalPaid;
@@ -159,7 +203,8 @@ const getPaymentById = catchAsync(async (req, res) => {
 
 /**
  * @desc  Update non-financial metadata only (mode, reference, remarks).
- *        principalPaid / interestPaid are permanent once recorded.
+ *        principalPaid / interestPaid — and which months they cleared —
+ *        are permanent once recorded.
  * @route PATCH /api/v1/payments/:id
  */
 const updatePayment = catchAsync(async (req, res) => {

@@ -3,7 +3,9 @@ const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
 const Loan = require('../models/Loan');
 const Borrower = require('../models/Borrower');
+const MonthlyInterest = require('../models/MonthlyInterest');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
+const { ensureFirstMonthInterest } = require('../jobs/interestJob');
 
 /**
  * @desc  Create a new loan for a borrower
@@ -17,6 +19,12 @@ const createLoan = catchAsync(async (req, res) => {
   }
 
   const loan = await Loan.create({ ...req.body, createdBy: req.user._id });
+
+  // The loan's own disbursal month already owes interest — generate that
+  // first MonthlyInterest record right away rather than waiting for the
+  // next cron tick (see jobs/interestJob.js).
+  await ensureFirstMonthInterest(loan);
+
   await loan.populate({ path: 'borrower', select: 'name phone status' });
 
   return new ApiResponse(201, 'Loan created successfully', { loan }).send(res, 201);
@@ -137,4 +145,40 @@ const markOverdue = catchAsync(async (req, res) => {
   return new ApiResponse(200, 'Loan marked as overdue', { loan }).send(res, 200);
 });
 
-module.exports = { createLoan, getLoans, getLoanById, updateLoan, closeLoan, markOverdue };
+/**
+ * @desc  Full month-by-month interest schedule for a loan, plus a summary
+ *        (pending months, pending amount, oldest/latest unpaid month,
+ *        last paid date, next due date). Computed dynamically from the
+ *        MonthlyInterest collection every time — never from a cached total.
+ * @route GET /api/v1/loans/:id/interest
+ */
+const getLoanInterestSchedule = catchAsync(async (req, res) => {
+  const loan = await Loan.findById(req.params.id).populate({ path: 'borrower', select: 'name phone' });
+  if (!loan) throw ApiError.notFound('Loan not found');
+
+  const months = await MonthlyInterest.find({ loan: loan._id }).sort({ year: 1, month: 1 }).lean();
+
+  const pending = months.filter((m) => m.status !== 'paid');
+  const paidMonths = months.filter((m) => m.status === 'paid');
+
+  const summary = {
+    pendingMonths: pending.length,
+    pendingInterestAmount: pending.reduce((sum, m) => sum + m.pendingAmount, 0),
+    oldestPendingMonth: pending[0] || null,
+    latestPendingMonth: pending.length ? pending[pending.length - 1] : null,
+    lastInterestPaidOn: paidMonths.length ? paidMonths[paidMonths.length - 1].paidDate : null,
+    nextInterestDueDate: pending.length ? pending[0].dueDate : null,
+  };
+
+  return new ApiResponse(200, 'Loan interest schedule fetched successfully', { loan, months, summary }).send(res, 200);
+});
+
+module.exports = {
+  createLoan,
+  getLoans,
+  getLoanById,
+  updateLoan,
+  closeLoan,
+  markOverdue,
+  getLoanInterestSchedule,
+};

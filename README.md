@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 — feature-complete for a v1.** Auth, Borrowers, Loans, Payments, monthly interest automation, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking.** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with FIFO payment allocation, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -99,13 +99,15 @@ All protected routes need header: `Authorization: Bearer <accessToken>`
 ### Dashboard
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/dashboard/summary` | Borrower/loan counts, total lent, outstanding principal, pending interest, today's/monthly collection |
+| GET | `/dashboard/summary` | Borrower/loan counts, totals, collections, **plus Pending Interest Tracking cards** — see below |
 | GET | `/dashboard/collection-trend?months=6` | Monthly collection totals, zero-filled for months with no activity |
 | GET | `/dashboard/principal-interest-trend?months=6` | Principal vs interest collected per month |
 | GET | `/dashboard/loan-status-distribution` | Active/closed/overdue counts + percentages |
 | GET | `/dashboard/recent-payments?limit=5` | Most recent payments, borrower populated |
 | GET | `/dashboard/overdue-loans?limit=5` | Overdue loans with computed `daysOverdue` |
 | GET | `/dashboard/top-borrowers?limit=5` | Ranked by total amount lent (aggregation pipeline) |
+
+`/dashboard/summary` includes five fields computed live from the `MonthlyInterest` collection on every request (never cached): `totalPendingInterest`, `totalPendingInterestMonths`, `borrowersWithPendingInterest`, `overdueInterestAmount`, `loansWithOverdueInterest`.
 
 ### Reports
 | Method | Endpoint | Description |
@@ -114,16 +116,30 @@ All protected routes need header: `Authorization: Bearer <accessToken>`
 | GET | `/reports/export/csv?...` | Same filters, streamed as a `.csv` download |
 | GET | `/reports/export/excel?...` | Same filters, streamed as a formatted `.xlsx` workbook (summary + detail sheet) |
 | GET | `/reports/export/pdf?...` | Same filters, streamed as a paginated `.pdf` document |
+| GET | `/reports/pending-interest?borrower=&loan=&minPendingMonths=&status=` | Borrowers/months with pending interest + summary totals |
+| GET | `/reports/overdue-interest?borrower=&loan=&dateFrom=` | Pending months whose due date has already passed, with `daysOverdue` |
+| GET | `/reports/interest-collection-history?months=6` | Interest **generated** (from `MonthlyInterest`) vs interest **collected** (from `Payment`), per month — two different timelines shown side by side |
+| GET | `/reports/export/pending-interest/csv?...` | Pending interest report as a `.csv` download |
 
-All three export formats and the JSON summary share one filter+fetch function (`fetchReportRows` in `reportController.js`), so a report and its export are always byte-for-byte consistent.
+All collection export formats and the JSON summary share one filter+fetch function (`fetchReportRows` in `reportController.js`), so a report and its export are always byte-for-byte consistent.
 
-### Jobs (monthly interest automation)
+### Jobs (interest automation)
 | Method | Endpoint | Access | Description |
 |---|---|---|
-| POST | `/jobs/generate-interest` | Admin only | Manually run the monthly interest generation for the current period |
+| POST | `/jobs/generate-interest` | Admin only | Manually run the daily interest check for every loan right now |
 | POST | `/jobs/check-overdue` | Admin only | Manually run the overdue-loan check |
 
-**How automation works**: `src/jobs/scheduler.js` registers a `node-cron` schedule (`INTEREST_CRON_DAY`/`INTEREST_CRON_HOUR` in `.env`, default: 1st of the month at 01:00) that calls `generateMonthlyInterest()` then `markOverdueLoans()` from `src/jobs/interestJob.js`. For every active/overdue loan, it creates an `InterestCharge` record (`principalOutstanding × interestRate / 100`) for the current `YYYY-MM` period and adds it to `Loan.totalInterestAccrued`. A unique index on `InterestCharge{loan, periodKey}` makes this **idempotent** — running it twice in the same month (via cron + a manual trigger, or after a missed tick) never double-charges a borrower; the second attempt is simply skipped. The `/jobs/*` endpoints exist so this can be exercised on demand instead of waiting for a real month to pass.
+## Pending Monthly Interest Tracking
+
+This is the core domain model of the system, so it's worth explaining in full.
+
+**One record per loan per calendar month.** The `MonthlyInterest` collection holds a permanent document for every month a loan has been active — `{ loan, borrower, month, year, interestAmount, paidAmount, pendingAmount, status, dueDate, paidDate }`. `pendingAmount` and `status` (`pending` / `partially_paid` / `paid`) are derived automatically from `interestAmount - paidAmount` in a `pre('save')` hook — nothing ever sets them directly, so they can't drift out of sync. **Records are never merged, edited, or deleted**; an unpaid month just sits there as `pending` forever until a payment clears it.
+
+**Generation happens on each loan's own "money taken day".** Rather than one fixed date for the whole system, `src/jobs/interestJob.js` runs a check **daily** (`src/jobs/scheduler.js`, `INTEREST_CRON_HOUR` in `.env`) and, for every active/overdue loan, asks: *is today this loan's billing anniversary — the day-of-month it was disbursed?* If so, and no record exists yet for the current month, it generates one (`principalOutstanding × interestRate / 100`, clamped for short months so a loan disbursed on the 31st still bills on the 28th/30th). The loan's **first** month is generated immediately at loan creation (`ensureFirstMonthInterest`, called from `loanController.createLoan`) rather than waiting for a cron tick, since the brief's example table starts counting from the disbursal month. A unique index on `(loan, year, month)` makes every generation idempotent.
+
+**Payments always clear the oldest unpaid month first — FIFO, no exceptions.** `paymentController.allocateInterestFifo` walks a loan's pending `MonthlyInterest` records oldest-first and applies the payment's `interestPaid` across as many as it covers, exactly like the brief's example (Feb + Mar + Apr pending, borrower pays enough for two → Feb and Mar become `paid`, Apr stays `pending`). There is no API for picking which month a payment clears — that's a deliberate constraint, not an oversight. Every allocation is recorded on the `Payment` document itself (`interestAllocations: [{ monthlyInterest, month, year, amountApplied }]`) as a permanent audit trail back to exactly which months a given payment touched.
+
+**Everything is computed live, nothing is trusted from a cache.** Dashboard cards, the borrower's Interest Summary, a loan's Interest Schedule, and every pending/overdue interest report all query `MonthlyInterest` directly at request time. (`Loan.totalInterestAccrued`/`totalInterestPaid` still exist as fast denormalized figures for list views, but they're a convenience, not the source of truth.)
 
 ## Quick Test
 
@@ -167,6 +183,15 @@ curl "http://localhost:5000/api/v1/dashboard/summary" \
 
 curl "http://localhost:5000/api/v1/reports/export/csv" \
   -H "Authorization: Bearer <accessToken>" -o report.csv
+
+curl "http://localhost:5000/api/v1/loans/<loanId>/interest" \
+  -H "Authorization: Bearer <accessToken>"
+
+curl "http://localhost:5000/api/v1/reports/pending-interest" \
+  -H "Authorization: Bearer <accessToken>"
+
+curl "http://localhost:5000/api/v1/reports/overdue-interest" \
+  -H "Authorization: Bearer <accessToken>"
 ```
 
 Edge cases to verify:
@@ -177,9 +202,13 @@ Edge cases to verify:
 - Running `POST /jobs/generate-interest` twice in a row → second run reports `generated: 0, skipped: <n>` (idempotent, no double-charge)
 - `POST /jobs/generate-interest` / `check-overdue` as a non-admin → `403`
 - `GET /dashboard/summary` numbers reconcile with what you'd expect from the borrowers/loans/payments you created above
+- Create a loan, then immediately `GET /loans/:id/interest` → the disbursal month's `MonthlyInterest` record already exists with `status: 'pending'`
+- Create three months of pending interest (e.g. by backdating test data or waiting for cron ticks), then pay an amount covering exactly two months' worth of interest → the two oldest months become `paid`, the third stays `pending` (FIFO)
+- Pay more interest than is currently pending across all months → the excess shows up as `unallocatedInterest` on the `Payment`, not silently dropped
+- A `MonthlyInterest` whose `dueDate` has passed and is still unpaid → counted in `/dashboard/summary`'s `overdueInterestAmount` and shows up in `/reports/overdue-interest`
 
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, automatic monthly interest generation, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking addendum is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, per-loan monthly interest generation on each borrower's own billing day, FIFO interest payment allocation, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT

@@ -3,6 +3,7 @@ const ApiResponse = require('../utils/ApiResponse');
 const Borrower = require('../models/Borrower');
 const Loan = require('../models/Loan');
 const Payment = require('../models/Payment');
+const MonthlyInterest = require('../models/MonthlyInterest');
 
 const startOfDay = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 const startOfMonth = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), 1);
@@ -24,6 +25,8 @@ const getSummary = catchAsync(async (req, res) => {
     loanAggregates,
     todaysCollectionAgg,
     monthlyCollectionAgg,
+    pendingInterestAgg,
+    overdueInterestAgg,
   ] = await Promise.all([
     Borrower.countDocuments({ status: 'active' }),
     Loan.countDocuments({ status: 'active' }),
@@ -37,11 +40,6 @@ const getSummary = catchAsync(async (req, res) => {
           outstandingPrincipal: {
             $sum: { $cond: [{ $in: ['$status', ['active', 'overdue']] }, '$principalOutstanding', 0] },
           },
-          pendingInterest: {
-            $sum: {
-              $max: [{ $subtract: ['$totalInterestAccrued', '$totalInterestPaid'] }, 0],
-            },
-          },
         },
       },
     ]),
@@ -53,9 +51,34 @@ const getSummary = catchAsync(async (req, res) => {
       { $match: { paymentDate: { $gte: monthStart } } },
       { $group: { _id: null, total: { $sum: { $add: ['$principalPaid', '$interestPaid'] } } } },
     ]),
+    // Pending Interest Tracking cards — computed dynamically from the
+    // MonthlyInterest ledger every time, never from a cached total.
+    MonthlyInterest.aggregate([
+      { $match: { status: { $ne: 'paid' } } },
+      {
+        $group: {
+          _id: null,
+          totalPendingInterest: { $sum: '$pendingAmount' },
+          totalPendingMonths: { $sum: 1 },
+          borrowers: { $addToSet: '$borrower' },
+        },
+      },
+    ]),
+    MonthlyInterest.aggregate([
+      { $match: { status: { $ne: 'paid' }, dueDate: { $lt: now } } },
+      {
+        $group: {
+          _id: null,
+          overdueInterestAmount: { $sum: '$pendingAmount' },
+          loans: { $addToSet: '$loan' },
+        },
+      },
+    ]),
   ]);
 
-  const aggregates = loanAggregates[0] || { totalAmountLent: 0, outstandingPrincipal: 0, pendingInterest: 0 };
+  const aggregates = loanAggregates[0] || { totalAmountLent: 0, outstandingPrincipal: 0 };
+  const pendingInterest = pendingInterestAgg[0] || { totalPendingInterest: 0, totalPendingMonths: 0, borrowers: [] };
+  const overdueInterest = overdueInterestAgg[0] || { overdueInterestAmount: 0, loans: [] };
 
   return new ApiResponse(200, 'Dashboard summary fetched successfully', {
     totalBorrowers,
@@ -64,9 +87,14 @@ const getSummary = catchAsync(async (req, res) => {
     overdueLoans,
     totalAmountLent: aggregates.totalAmountLent,
     outstandingPrincipal: aggregates.outstandingPrincipal,
-    pendingInterest: Math.round(aggregates.pendingInterest),
     todaysCollection: todaysCollectionAgg[0]?.total || 0,
     monthlyCollection: monthlyCollectionAgg[0]?.total || 0,
+    // Pending Interest Tracking
+    totalPendingInterest: Math.round(pendingInterest.totalPendingInterest),
+    totalPendingInterestMonths: pendingInterest.totalPendingMonths,
+    borrowersWithPendingInterest: pendingInterest.borrowers.length,
+    overdueInterestAmount: Math.round(overdueInterest.overdueInterestAmount),
+    loansWithOverdueInterest: overdueInterest.loans.length,
   }).send(res, 200);
 });
 

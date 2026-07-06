@@ -58,6 +58,29 @@ const paymentSchema = new mongoose.Schema(
       fileName: String,
       filePath: String,
     },
+    // Audit trail of exactly which month(s) this payment's interestPaid was
+    // applied to, in FIFO order (oldest unpaid month first — see
+    // paymentController.createPayment). A single payment can span several
+    // months if it clears more than one. Empty when interestPaid is 0, or
+    // when interestPaid exceeds all currently-pending months (the leftover
+    // is recorded but not tied to a specific month — see
+    // `unallocatedInterest` below).
+    interestAllocations: [
+      {
+        monthlyInterest: { type: mongoose.Schema.Types.ObjectId, ref: 'MonthlyInterest' },
+        month: Number,
+        year: Number,
+        amountApplied: Number,
+      },
+    ],
+    // Any portion of interestPaid that didn't fit into a pending month
+    // (e.g. borrower pays ahead of what's been generated so far). Kept
+    // visible rather than silently dropped.
+    unallocatedInterest: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     // Snapshot of the loan's outstanding principal immediately after this
     // payment was applied. Stored at write-time (not computed later) so
     // the historical ledger reads correctly even if the loan changes further.

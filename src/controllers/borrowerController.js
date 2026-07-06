@@ -2,6 +2,7 @@ const catchAsync = require('../utils/catchAsync');
 const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
 const Borrower = require('../models/Borrower');
+const MonthlyInterest = require('../models/MonthlyInterest');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
 
 /**
@@ -53,7 +54,25 @@ const getBorrowerById = catchAsync(async (req, res) => {
 
   if (!borrower) throw ApiError.notFound('Borrower not found');
 
-  return new ApiResponse(200, 'Borrower fetched successfully', { borrower }).send(res, 200);
+  // Interest summary across every loan this borrower has, computed fresh
+  // from the MonthlyInterest ledger — never from a cached total.
+  const pendingMonths = await MonthlyInterest.find({ borrower: borrower._id, status: { $ne: 'paid' } })
+    .sort({ year: 1, month: 1 })
+    .lean();
+  const lastPaid = await MonthlyInterest.findOne({ borrower: borrower._id, status: 'paid' })
+    .sort({ paidDate: -1 })
+    .lean();
+
+  const interestSummary = {
+    pendingMonths: pendingMonths.length,
+    pendingInterestAmount: pendingMonths.reduce((sum, m) => sum + m.pendingAmount, 0),
+    oldestPendingMonth: pendingMonths[0] || null,
+    latestPendingMonth: pendingMonths.length ? pendingMonths[pendingMonths.length - 1] : null,
+    lastInterestPaidOn: lastPaid?.paidDate || null,
+    nextInterestDueDate: pendingMonths.length ? pendingMonths[0].dueDate : null,
+  };
+
+  return new ApiResponse(200, 'Borrower fetched successfully', { borrower, interestSummary }).send(res, 200);
 });
 
 /**

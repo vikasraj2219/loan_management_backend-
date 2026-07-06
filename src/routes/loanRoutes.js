@@ -6,6 +6,7 @@ const {
   updateLoan,
   closeLoan,
   markOverdue,
+  getLoanInterestSchedule,
 } = require('../controllers/loanController');
 const { createLoanRules, updateLoanRules, idParamRule } = require('../validators/loanValidator');
 const validate = require('../middlewares/validate');
@@ -23,6 +24,9 @@ router
   .route('/:id')
   .get(idParamRule, validate, getLoanById)
   .patch(updateLoanRules, validate, updateLoan);
+
+// GET /loans/:id/interest - full month-by-month interest schedule + pending summary
+router.get('/:id/interest', idParamRule, validate, getLoanInterestSchedule);
 
 // PATCH /loans/:id/close - close a fully repaid loan
 router.patch('/:id/close', idParamRule, validate, closeLoan);

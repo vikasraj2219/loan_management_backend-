@@ -62,9 +62,11 @@ const loanSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
-    // Running total of every InterestCharge ever generated for this loan
-    // by the monthly cron job (Phase 4). pendingInterest = this minus
-    // totalInterestPaid — see the virtual below.
+    // Running total of every MonthlyInterest record ever generated for this
+    // loan by the daily cron job (see jobs/interestJob.js). This is a cached
+    // convenience total; the authoritative source for pending/overdue
+    // interest reporting is the MonthlyInterest collection itself, queried
+    // dynamically — see dashboardController and reportController.
     totalInterestAccrued: {
       type: Number,
       default: 0,
@@ -125,6 +127,14 @@ loanSchema.virtual('totalOutstanding').get(function getTotalOutstanding() {
 // Payments belonging to this loan (Phase 3).
 loanSchema.virtual('payments', {
   ref: 'Payment',
+  localField: '_id',
+  foreignField: 'loan',
+});
+
+// Every month's interest record for this loan (Pending Interest Tracking) —
+// sort by periodKey when populating to get chronological order.
+loanSchema.virtual('monthlyInterests', {
+  ref: 'MonthlyInterest',
   localField: '_id',
   foreignField: 'loan',
 });

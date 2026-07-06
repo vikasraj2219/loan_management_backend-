@@ -3,6 +3,7 @@ const ExcelJS = require('exceljs');
 const catchAsync = require('../utils/catchAsync');
 const ApiResponse = require('../utils/ApiResponse');
 const Payment = require('../models/Payment');
+const MonthlyInterest = require('../models/MonthlyInterest');
 const { formatCurrencyPlain } = require('../utils/format');
 
 /**
@@ -184,4 +185,193 @@ const exportPdf = catchAsync(async (req, res) => {
   doc.end();
 });
 
-module.exports = { getCollectionReport, exportCsv, exportExcel, exportPdf };
+/**
+ * Shared filter builder for pending-interest-style reports (both the
+ * pending list and the overdue list use the same filter shape).
+ */
+const buildMonthlyInterestFilter = (query) => {
+  const filter = {};
+  if (query.borrower) filter.borrower = query.borrower;
+  if (query.loan) filter.loan = query.loan;
+  if (query.status) filter.status = query.status;
+  if (query.dateFrom || query.dateTo) {
+    filter.dueDate = {};
+    if (query.dateFrom) filter.dueDate.$gte = new Date(query.dateFrom);
+    if (query.dateTo) filter.dueDate.$lte = new Date(query.dateTo);
+  }
+  return filter;
+};
+
+/**
+ * @desc  Borrowers/months with pending interest — filterable by borrower,
+ *        loan, status, and due-date range. Computed live from
+ *        MonthlyInterest every time.
+ * @route GET /api/v1/reports/pending-interest
+ */
+const getPendingInterestReport = catchAsync(async (req, res) => {
+  const filter = { ...buildMonthlyInterestFilter(req.query), status: { $ne: 'paid' } };
+  if (req.query.status && req.query.status !== 'paid') filter.status = req.query.status;
+
+  const months = await MonthlyInterest.find(filter)
+    .populate({ path: 'borrower', select: 'name phone' })
+    .populate({ path: 'loan', select: 'loanAmount status interestRate' })
+    .sort({ dueDate: 1 })
+    .lean();
+
+  // Optional "at least N pending months" filter, applied per-borrower.
+  const minPendingMonths = req.query.minPendingMonths ? Number(req.query.minPendingMonths) : null;
+  const byBorrower = new Map();
+  months.forEach((m) => {
+    const key = m.borrower?._id?.toString();
+    if (!key) return;
+    if (!byBorrower.has(key)) byBorrower.set(key, []);
+    byBorrower.get(key).push(m);
+  });
+
+  const borrowerSummaries = Array.from(byBorrower.entries())
+    .map(([, rows]) => ({
+      borrower: rows[0].borrower,
+      pendingMonths: rows.length,
+      pendingInterestAmount: rows.reduce((sum, r) => sum + r.pendingAmount, 0),
+      oldestDueDate: rows[0].dueDate,
+    }))
+    .filter((b) => !minPendingMonths || b.pendingMonths >= minPendingMonths);
+
+  const summary = {
+    totalPendingInterest: months.reduce((sum, m) => sum + m.pendingAmount, 0),
+    totalPendingMonths: months.length,
+    borrowersAffected: borrowerSummaries.length,
+  };
+
+  return new ApiResponse(200, 'Pending interest report generated successfully', {
+    summary,
+    borrowerSummaries,
+    months,
+  }).send(res, 200);
+});
+
+/**
+ * @desc  Overdue interest — pending months whose due date has already
+ *        passed. Distinct from a loan's own overdue status.
+ * @route GET /api/v1/reports/overdue-interest
+ */
+const getOverdueInterestReport = catchAsync(async (req, res) => {
+  const filter = { ...buildMonthlyInterestFilter(req.query), status: { $ne: 'paid' }, dueDate: { $lt: new Date() } };
+  if (req.query.dateFrom) filter.dueDate.$gte = new Date(req.query.dateFrom);
+
+  const months = await MonthlyInterest.find(filter)
+    .populate({ path: 'borrower', select: 'name phone' })
+    .populate({ path: 'loan', select: 'loanAmount status interestRate' })
+    .sort({ dueDate: 1 })
+    .lean();
+
+  const now = Date.now();
+  const withDaysOverdue = months.map((m) => ({ ...m, daysOverdue: Math.floor((now - new Date(m.dueDate).getTime()) / 86400000) }));
+
+  const summary = {
+    totalOverdueInterest: months.reduce((sum, m) => sum + m.pendingAmount, 0),
+    totalOverdueMonths: months.length,
+    loansAffected: new Set(months.map((m) => m.loan?._id?.toString())).size,
+  };
+
+  return new ApiResponse(200, 'Overdue interest report generated successfully', { summary, months: withDaysOverdue }).send(
+    res,
+    200
+  );
+});
+
+/**
+ * @desc  Monthly interest generated (from MonthlyInterest) vs monthly
+ *        interest actually collected (from Payment.interestPaid) —
+ *        two different timelines, shown side by side.
+ * @route GET /api/v1/reports/interest-collection-history?months=6
+ */
+const getInterestCollectionHistory = catchAsync(async (req, res) => {
+  const months = Math.min(parseInt(req.query.months, 10) || 6, 24);
+  const from = new Date();
+  from.setMonth(from.getMonth() - (months - 1));
+  from.setDate(1);
+  from.setHours(0, 0, 0, 0);
+
+  const [generatedRows, collectedRows] = await Promise.all([
+    MonthlyInterest.aggregate([
+      { $match: { dueDate: { $gte: from } } },
+      { $group: { _id: { year: '$year', month: '$month' }, total: { $sum: '$interestAmount' } } },
+    ]),
+    Payment.aggregate([
+      { $match: { paymentDate: { $gte: from }, interestPaid: { $gt: 0 } } },
+      {
+        $group: {
+          _id: { year: { $year: '$paymentDate' }, month: { $month: '$paymentDate' } },
+          total: { $sum: '$interestPaid' },
+        },
+      },
+    ]),
+  ]);
+
+  const series = [];
+  const cursor = new Date(from);
+  for (let i = 0; i < months; i += 1) {
+    const year = cursor.getFullYear();
+    const month = cursor.getMonth() + 1;
+    const generated = generatedRows.find((r) => r._id.year === year && r._id.month === month);
+    const collected = collectedRows.find((r) => r._id.year === year && r._id.month === month);
+    series.push({
+      label: cursor.toLocaleString('en-US', { month: 'short' }),
+      year,
+      month,
+      generated: generated?.total || 0,
+      collected: collected?.total || 0,
+    });
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+
+  return new ApiResponse(200, 'Interest collection history fetched successfully', { series }).send(res, 200);
+});
+
+/**
+ * @desc  Export the pending interest report as a CSV file.
+ * @route GET /api/v1/reports/export/pending-interest/csv
+ */
+const exportPendingInterestCsv = catchAsync(async (req, res) => {
+  const filter = { ...buildMonthlyInterestFilter(req.query), status: { $ne: 'paid' } };
+  const months = await MonthlyInterest.find(filter)
+    .populate({ path: 'borrower', select: 'name phone' })
+    .sort({ dueDate: 1 })
+    .lean();
+
+  const header = ['Borrower', 'Phone', 'Month', 'Year', 'Due Date', 'Interest Amount', 'Paid Amount', 'Pending Amount', 'Status'];
+  const escape = (val) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+  const rows = months.map((m) =>
+    [
+      m.borrower?.name,
+      m.borrower?.phone,
+      m.month,
+      m.year,
+      new Date(m.dueDate).toISOString().slice(0, 10),
+      m.interestAmount,
+      m.paidAmount,
+      m.pendingAmount,
+      m.status,
+    ]
+      .map(escape)
+      .join(',')
+  );
+
+  const csv = [header.map(escape).join(','), ...rows].join('\n');
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="pending-interest-${Date.now()}.csv"`);
+  res.status(200).send(csv);
+});
+
+module.exports = {
+  getCollectionReport,
+  exportCsv,
+  exportExcel,
+  exportPdf,
+  getPendingInterestReport,
+  getOverdueInterestReport,
+  getInterestCollectionHistory,
+  exportPendingInterestCsv,
+};
