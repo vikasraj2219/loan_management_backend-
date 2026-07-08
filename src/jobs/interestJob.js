@@ -2,50 +2,97 @@ const Loan = require('../models/Loan');
 const MonthlyInterest = require('../models/MonthlyInterest');
 const Payment = require('../models/Payment');
 const { allocateInterestFifo } = require('../services/interestAllocationService');
+const withTransaction = require('../utils/withTransaction');
 
 const periodKeyOf = (year, month) => `${year}-${String(month).padStart(2, '0')}`;
 
 const daysInMonth = (year, monthIndex0) => new Date(year, monthIndex0 + 1, 0).getDate();
 
 /**
- * Generates a single month's interest record for one loan, for the given
- * `periodDate` (whose year/month determine the period, and whose day
- * becomes the record's dueDate). Idempotent — if a record already exists
- * for this (loan, year, month), it's a no-op (returns null), so this is
- * safe to call from both loan creation and the daily cron without ever
- * double-charging.
- *
- * Does NOT touch any other month's record — previous unpaid months are
- * left exactly as they are, which is what "carries forward" pending
- * interest means in this system: nothing merges, nothing gets overwritten.
+ * Adds one calendar month to `date`, clamped to that month's own day
+ * count (so the 22nd of a 31-day month rolls to the 22nd of a 28-day
+ * month, never the 1st of the month after). Used to walk a loan's
+ * billing cycle one period at a time.
  */
-async function generateInterestForPeriod(loan, periodDate) {
-  const year = periodDate.getFullYear();
-  const month = periodDate.getMonth() + 1; // 1-12
-  const amount = Math.round((loan.principalOutstanding * loan.interestRate) / 100);
+function addOneMonth(date) {
+  const day = date.getDate();
+  let year = date.getFullYear();
+  let month = date.getMonth() + 1; // moving forward one month, 0-indexed target
+  if (month > 11) {
+    month = 0;
+    year += 1;
+  }
+  const clampedDay = Math.min(day, daysInMonth(year, month));
+  return new Date(year, month, clampedDay);
+}
+
+/**
+ * The outstanding principal to use for the interest period due on
+ * `dueDate` — the loan's original amount minus every principal payment
+ * made *before* that due date. This is deliberately NOT the loan's current
+ * live `principalOutstanding`: a payment made after this period's due date
+ * must never change what this period already owed (see Requirement 5/6 —
+ * principal reductions only ever affect *future* interest, and a generated
+ * record is permanent once created).
+ */
+async function principalAsOfDueDate(loan, dueDate) {
+  const rows = await Payment.aggregate([
+    { $match: { loan: loan._id, paymentDate: { $lt: dueDate } } },
+    { $group: { _id: null, totalPrincipalPaid: { $sum: '$principalPaid' } } },
+  ]);
+  const paidBefore = rows[0]?.totalPrincipalPaid || 0;
+  return Math.max(loan.loanAmount - paidBefore, 0);
+}
+
+/**
+ * Generates a single month's interest record for one loan, for the given
+ * `dueDate`. Idempotent — if a record already exists for this (loan, year,
+ * month), it's a no-op (returns null). Interest is computed from the
+ * outstanding principal *as of dueDate* (see principalAsOfDueDate), not
+ * the loan's current balance — this is what makes a historical record
+ * correct even when generated well after the fact, and why it never needs
+ * to be recalculated later.
+ *
+ * Wrapped in a transaction (with graceful fallback) since it writes both
+ * the MonthlyInterest record and the loan's denormalized
+ * totalInterestAccrued in one logical step.
+ */
+async function generateInterestForPeriod(loan, dueDate) {
+  const year = dueDate.getFullYear();
+  const month = dueDate.getMonth() + 1; // 1-12
+
+  const principal = await principalAsOfDueDate(loan, dueDate);
+  const amount = Math.round((principal * loan.interestRate) / 100);
 
   if (amount <= 0) return null;
 
   try {
-    const record = await MonthlyInterest.create({
-      loan: loan._id,
-      borrower: loan.borrower,
-      month,
-      year,
-      periodKey: periodKeyOf(year, month),
-      interestAmount: amount,
-      paidAmount: 0,
-      dueDate: periodDate,
-      principalOutstandingAtCharge: loan.principalOutstanding,
-      interestRateAtCharge: loan.interestRate,
-      generatedAt: new Date(),
+    return await withTransaction(async (session) => {
+      const [record] = await MonthlyInterest.create(
+        [
+          {
+            loan: loan._id,
+            borrower: loan.borrower,
+            month,
+            year,
+            periodKey: periodKeyOf(year, month),
+            interestAmount: amount,
+            paidAmount: 0,
+            dueDate,
+            principalOutstandingAtCharge: principal,
+            interestRateAtCharge: loan.interestRate,
+            generatedAt: new Date(),
+          },
+        ],
+        { session }
+      );
+
+      loan.totalInterestAccrued += amount;
+      loan.lastInterestGeneratedAt = new Date();
+      await loan.save({ session });
+
+      return record;
     });
-
-    loan.totalInterestAccrued += amount;
-    loan.lastInterestGeneratedAt = new Date();
-    await loan.save();
-
-    return record;
   } catch (err) {
     if (err.code === 11000) return null; // already generated for this period — expected on re-run
     throw err;
@@ -53,126 +100,40 @@ async function generateInterestForPeriod(loan, periodDate) {
 }
 
 /**
- * Generates the very first month's interest record immediately when a
- * loan is created, for the calendar month of loanDate itself — this is
- * why a loan disbursed in January already shows a January interest row
- * (see the brief's example table) instead of waiting for the first
- * anniversary. Called once from loanController.createLoan.
+ * Enumerates every billing period due between a loan's first interest
+ * cycle and `generateTill`, inclusive. The FIRST due date is exactly one
+ * month after loanDate — a loan issued 22 Jun bills first on 22 Jul, never
+ * on the issue date itself, since interest for a cycle is only owed once
+ * that cycle is complete (Requirement 1). Each subsequent period is one
+ * more month on from there, clamped for short months. Stops as soon as a
+ * period's due date would fall after `generateTill`, so this never
+ * generates a cycle that hasn't finished yet (Requirement 2).
  */
-async function ensureFirstMonthInterest(loan) {
-  return generateInterestForPeriod(loan, loan.loanDate);
-}
-
-/**
- * Daily job: for every active/overdue loan, checks whether *today* is
- * that loan's "money taken day" — the day-of-month of its own loanDate,
- * clamped to the days actually in the current month (so a loan disbursed
- * on the 31st still bills on the 28th/30th in shorter months) — and if so,
- * generates that month's interest record. Each loan bills on its own
- * anniversary day, not a single fixed date for the whole system.
- *
- * The origination month itself is skipped here since ensureFirstMonthInterest
- * already created it at loan-creation time; this only ever generates
- * month 2 onward. Safe to run more than once a day or after a missed day —
- * the unique (loan, year, month) index on MonthlyInterest makes it a no-op
- * for anything already generated.
- */
-async function generateMonthlyInterest(now = new Date()) {
-  const loans = await Loan.find({ status: { $in: ['active', 'overdue'] } });
-
-  const summary = {
-    date: now.toISOString().slice(0, 10),
-    totalLoans: loans.length,
-    generated: 0,
-    skipped: 0,
-    failed: 0,
-    errors: [],
-  };
-
-  for (const loan of loans) {
-    try {
-      const originDay = new Date(loan.loanDate).getDate();
-      const billingDay = Math.min(originDay, daysInMonth(now.getFullYear(), now.getMonth()));
-
-      const isOriginationMonth =
-        now.getFullYear() === new Date(loan.loanDate).getFullYear() &&
-        now.getMonth() === new Date(loan.loanDate).getMonth();
-
-      if (isOriginationMonth || now.getDate() < billingDay) {
-        summary.skipped += 1;
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      const periodDate = new Date(now.getFullYear(), now.getMonth(), billingDay);
-      // eslint-disable-next-line no-await-in-loop
-      const record = await generateInterestForPeriod(loan, periodDate);
-      if (record) summary.generated += 1;
-      else summary.skipped += 1;
-    } catch (err) {
-      summary.failed += 1;
-      summary.errors.push({ loan: loan._id.toString(), message: err.message });
-    }
-  }
-
-  return summary;
-}
-
-/**
- * Flags active loans whose own due date has passed as 'overdue'. This is
- * about the loan's overall due date/tenure, distinct from per-month
- * "overdue interest" (an unpaid MonthlyInterest whose dueDate has passed),
- * which is tracked separately — see dashboardController's overdue-interest
- * cards, which query MonthlyInterest directly rather than Loan.status.
- */
-async function markOverdueLoans(now = new Date()) {
-  const result = await Loan.updateMany({ status: 'active', dueDate: { $lt: now } }, { $set: { status: 'overdue' } });
-  return { matched: result.matchedCount, modified: result.modifiedCount };
-}
-
-/**
- * Enumerates every billing period (one per calendar month) between a
- * loan's disbursal date and `generateTill`, inclusive — each period's
- * `periodDate` is that loan's own billing day for that month (clamped for
- * short months), matching the logic in generateMonthlyInterest(). Stops
- * as soon as a period's billing day would fall after `generateTill`, so
- * this never generates a month that isn't due yet.
- */
-function enumerateBillingPeriods(loanDate, generateTill) {
+function enumerateDuePeriods(loanDate, generateTill) {
   const periods = [];
-  const originDay = loanDate.getDate();
-  let cursorYear = loanDate.getFullYear();
-  let cursorMonth = loanDate.getMonth(); // 0-indexed
+  let cursor = addOneMonth(loanDate);
 
   // Safety cap so a bad date can never spin this into an infinite loop.
   for (let i = 0; i < 1200; i += 1) {
-    const billingDay = Math.min(originDay, daysInMonth(cursorYear, cursorMonth));
-    const periodDate = new Date(cursorYear, cursorMonth, billingDay);
-    if (periodDate > generateTill) break;
-
-    periods.push({ year: cursorYear, month: cursorMonth + 1, periodDate });
-
-    cursorMonth += 1;
-    if (cursorMonth > 11) {
-      cursorMonth = 0;
-      cursorYear += 1;
-    }
+    if (cursor > generateTill) break;
+    periods.push({ year: cursor.getFullYear(), month: cursor.getMonth() + 1, dueDate: cursor });
+    cursor = addOneMonth(cursor);
   }
 
   return periods;
 }
 
 /**
- * After backfilling missing months for a loan, sweeps that loan's
- * payments (oldest first) that still have leftover `unallocatedInterest`
- * — money that was paid toward interest before any MonthlyInterest record
- * existed to absorb it — and re-applies that leftover FIFO against the
- * months that were just created. This is what makes "recovering missing
- * monthly records" actually fix a loan's Interest Summary: without it, a
- * payment made before this feature ever ran would stay permanently
- * unallocated even after the records it should have paid off show up.
- * Never touches a payment's principalPaid/interestPaid — only its
- * unallocatedInterest and interestAllocations audit trail move.
+ * After generating any new months for a loan, sweeps that loan's payments
+ * (oldest first) that still have leftover `unallocatedInterest` — money
+ * paid toward interest before any MonthlyInterest record existed to
+ * absorb it — and re-applies that leftover FIFO against the months that
+ * were just created. Without this, a payment made before this feature (or
+ * before a given month's cycle had even completed) would stay permanently
+ * unallocated even after the record it should pay off shows up. Never
+ * touches a payment's principalPaid/interestPaid — only its
+ * unallocatedInterest and interestAllocations audit trail move, and each
+ * payment's reallocation is one transaction.
  */
 async function reconcilePaymentsAgainstBackfilledMonths(loanId) {
   const payments = await Payment.find({ loan: loanId, unallocatedInterest: { $gt: 0 } }).sort({ paymentDate: 1 });
@@ -180,14 +141,17 @@ async function reconcilePaymentsAgainstBackfilledMonths(loanId) {
   let totalReconciled = 0;
   for (const payment of payments) {
     // eslint-disable-next-line no-await-in-loop
-    const { allocations, unallocated } = await allocateInterestFifo(loanId, payment.unallocatedInterest, payment.paymentDate, null);
-    if (allocations.length > 0) {
-      totalReconciled += payment.unallocatedInterest - unallocated;
+    const applied = await withTransaction(async (session) => {
+      const { allocations, unallocated } = await allocateInterestFifo(loanId, payment.unallocatedInterest, payment.paymentDate, session);
+      if (allocations.length === 0) return 0;
+
+      const before = payment.unallocatedInterest;
       payment.interestAllocations.push(...allocations);
       payment.unallocatedInterest = unallocated;
-      // eslint-disable-next-line no-await-in-loop
-      await payment.save();
-    }
+      await payment.save({ session });
+      return before - unallocated;
+    });
+    totalReconciled += applied;
   }
 
   return totalReconciled;
@@ -195,16 +159,17 @@ async function reconcilePaymentsAgainstBackfilledMonths(loanId) {
 
 /**
  * Generates every missing MonthlyInterest record for one loan, from its
- * disbursal date up to `generateTill` (default: now) — not just "this
- * month" like the daily cron. This is the manual backfill entry point for:
- * initial setup, loans that existed before this feature shipped, data
- * migration, and recovering from a period where the cron didn't run.
+ * first completed billing cycle up to `generateTill` (default: now). This
+ * is the shared core used by both the daily cron (generateTill = today)
+ * and the manual backfill endpoint (generateTill = any date, any scope) —
+ * they're the same operation at different scopes, so there's exactly one
+ * implementation of "what counts as due" to keep in sync.
  * Duplicate-safe: existing months are detected and skipped, never
  * overwritten (checked directly rather than relying solely on the unique
  * index, so the summary's duplicatesSkipped count is accurate).
  */
-async function backfillLoanInterest(loan, generateTill) {
-  const periods = enumerateBillingPeriods(new Date(loan.loanDate), generateTill);
+async function generateMissingInterestForLoan(loan, generateTill) {
+  const periods = enumerateDuePeriods(new Date(loan.loanDate), generateTill);
 
   let recordsCreated = 0;
   let duplicatesSkipped = 0;
@@ -222,7 +187,7 @@ async function backfillLoanInterest(loan, generateTill) {
       }
 
       // eslint-disable-next-line no-await-in-loop
-      const record = await generateInterestForPeriod(loan, period.periodDate);
+      const record = await generateInterestForPeriod(loan, period.dueDate);
       if (record) recordsCreated += 1;
       else duplicatesSkipped += 1; // race with another request, or amount was 0
     } catch (err) {
@@ -241,6 +206,50 @@ async function backfillLoanInterest(loan, generateTill) {
   }
 
   return { recordsCreated, duplicatesSkipped, failed, errors, interestReconciled };
+}
+
+/**
+ * Daily cron entry point: generates every due-but-missing month, up to
+ * today, for every active/overdue loan. Because generateMissingInterestForLoan
+ * only ever creates periods whose due date has actually passed, running
+ * this daily naturally produces "generate on each loan's own billing day"
+ * behavior without needing to special-case "is today the billing day" —
+ * a loan simply gets nothing new on the days nothing is due yet.
+ */
+async function generateMonthlyInterest(now = new Date()) {
+  const loans = await Loan.find({ status: { $in: ['active', 'overdue'] } });
+
+  const summary = {
+    date: now.toISOString().slice(0, 10),
+    totalLoans: loans.length,
+    generated: 0,
+    skipped: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  for (const loan of loans) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await generateMissingInterestForLoan(loan, now);
+    summary.generated += result.recordsCreated;
+    summary.skipped += result.duplicatesSkipped;
+    summary.failed += result.failed;
+    summary.errors.push(...result.errors);
+  }
+
+  return summary;
+}
+
+/**
+ * Flags active loans whose own due date has passed as 'overdue'. This is
+ * about the loan's overall due date/tenure, distinct from per-month
+ * "overdue interest" (an unpaid MonthlyInterest whose dueDate has passed),
+ * which is tracked separately — see dashboardController's overdue-interest
+ * cards, which query MonthlyInterest directly rather than Loan.status.
+ */
+async function markOverdueLoans(now = new Date()) {
+  const result = await Loan.updateMany({ status: 'active', dueDate: { $lt: now } }, { $set: { status: 'overdue' } });
+  return { matched: result.matchedCount, modified: result.modifiedCount };
 }
 
 /**
@@ -271,7 +280,7 @@ async function generateInterestRecordsBulk({ loanId, borrowerId, generateTill } 
 
   for (const loan of loans) {
     // eslint-disable-next-line no-await-in-loop
-    const result = await backfillLoanInterest(loan, till);
+    const result = await generateMissingInterestForLoan(loan, till);
     summary.recordsCreated += result.recordsCreated;
     summary.duplicatesSkipped += result.duplicatesSkipped;
     summary.failed += result.failed;
@@ -284,11 +293,11 @@ async function generateInterestRecordsBulk({ loanId, borrowerId, generateTill } 
 
 module.exports = {
   generateInterestForPeriod,
-  ensureFirstMonthInterest,
+  generateMissingInterestForLoan,
   generateMonthlyInterest,
   markOverdueLoans,
   periodKeyOf,
-  enumerateBillingPeriods,
-  backfillLoanInterest,
+  enumerateDuePeriods,
+  principalAsOfDueDate,
   generateInterestRecordsBulk,
 };

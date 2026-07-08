@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
@@ -6,6 +5,7 @@ const Payment = require('../models/Payment');
 const Loan = require('../models/Loan');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
 const { allocateInterestFifo } = require('../services/interestAllocationService');
+const withTransaction = require('../utils/withTransaction');
 
 /**
  * @desc  Record a payment (principal and/or interest) against a loan.
@@ -15,14 +15,11 @@ const { allocateInterestFifo } = require('../services/interestAllocationService'
  *        a month the caller picks.
  * @route POST /api/v1/payments
  *
- * NOTE ON CONSISTENCY: ideally this runs inside a MongoDB transaction so
- * the Payment insert, Loan update, and every MonthlyInterest update commit
- * atomically. Transactions require a replica-set deployment; a standalone
- * `mongod` (common in local dev) does not support them. This code
- * opportunistically uses a transaction when the connection supports it,
- * and falls back to sequential writes otherwise — documented here rather
- * than hidden, since it's the one place in this codebase where a partial
- * failure could leave data slightly inconsistent.
+ * Wrapped in a transaction (via withTransaction) so the Payment insert,
+ * the FIFO interest allocation across however many MonthlyInterest
+ * records it touches, and the Loan balance update all commit atomically
+ * — with a graceful fallback to sequential writes on a standalone
+ * (non-replica-set) MongoDB, which doesn't support transactions at all.
  */
 const createPayment = catchAsync(async (req, res) => {
   const { loan: loanId, paymentDate, paymentMode, referenceNumber, remarks } = req.body;
@@ -45,55 +42,37 @@ const createPayment = catchAsync(async (req, res) => {
 
   const newOutstanding = loan.principalOutstanding - principalPaid;
 
-  const buildPaymentDoc = (allocationResult) => ({
-    loan: loan._id,
-    borrower: loan.borrower,
-    paymentDate: effectiveDate,
-    principalPaid,
-    interestPaid,
-    paymentMode,
-    referenceNumber,
-    remarks,
-    principalOutstandingAfter: newOutstanding,
-    interestAllocations: allocationResult.allocations,
-    unallocatedInterest: allocationResult.unallocated,
-    recordedBy: req.user._id,
+  const payment = await withTransaction(async (session) => {
+    const allocationResult = await allocateInterestFifo(loan._id, interestPaid, effectiveDate, session);
+
+    const [created] = await Payment.create(
+      [
+        {
+          loan: loan._id,
+          borrower: loan.borrower,
+          paymentDate: effectiveDate,
+          principalPaid,
+          interestPaid,
+          paymentMode,
+          referenceNumber,
+          remarks,
+          principalOutstandingAfter: newOutstanding,
+          interestAllocations: allocationResult.allocations,
+          unallocatedInterest: allocationResult.unallocated,
+          recordedBy: req.user._id,
+        },
+      ],
+      { session: session || undefined }
+    );
+
+    loan.principalOutstanding = newOutstanding;
+    loan.totalPrincipalPaid += principalPaid;
+    loan.totalInterestPaid += interestPaid;
+    loan.lastPaymentDate = created.paymentDate;
+    await loan.save({ session: session || undefined });
+
+    return created;
   });
-
-  const session = await mongoose.startSession();
-  let payment;
-  try {
-    await session.withTransaction(async () => {
-      const allocationResult = await allocateInterestFifo(loan._id, interestPaid, effectiveDate, session);
-
-      const [created] = await Payment.create([buildPaymentDoc(allocationResult)], { session });
-      payment = created;
-
-      loan.principalOutstanding = newOutstanding;
-      loan.totalPrincipalPaid += principalPaid;
-      loan.totalInterestPaid += interestPaid;
-      loan.lastPaymentDate = payment.paymentDate;
-      await loan.save({ session });
-    });
-  } catch (err) {
-    // Standalone MongoDB (no replica set) throws here because transactions
-    // aren't supported — fall back to sequential writes.
-    if (err.message?.includes('Transaction numbers') || err.codeName === 'IllegalOperation') {
-      const allocationResult = await allocateInterestFifo(loan._id, interestPaid, effectiveDate, null);
-
-      payment = await Payment.create(buildPaymentDoc(allocationResult));
-
-      loan.principalOutstanding = newOutstanding;
-      loan.totalPrincipalPaid += principalPaid;
-      loan.totalInterestPaid += interestPaid;
-      loan.lastPaymentDate = payment.paymentDate;
-      await loan.save();
-    } else {
-      throw err;
-    }
-  } finally {
-    session.endSession();
-  }
 
   await payment.populate([
     { path: 'loan', select: 'loanAmount principalOutstanding interestRate status' },

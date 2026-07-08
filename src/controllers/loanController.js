@@ -5,7 +5,6 @@ const Loan = require('../models/Loan');
 const Borrower = require('../models/Borrower');
 const MonthlyInterest = require('../models/MonthlyInterest');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
-const { ensureFirstMonthInterest } = require('../jobs/interestJob');
 
 /**
  * @desc  Create a new loan for a borrower
@@ -20,11 +19,12 @@ const createLoan = catchAsync(async (req, res) => {
 
   const loan = await Loan.create({ ...req.body, createdBy: req.user._id });
 
-  // The loan's own disbursal month already owes interest — generate that
-  // first MonthlyInterest record right away rather than waiting for the
-  // next cron tick (see jobs/interestJob.js).
-  await ensureFirstMonthInterest(loan);
-
+  // No interest is generated here on purpose: the first interest cycle
+  // only completes one full month after loanDate (Requirement 1), so the
+  // first MonthlyInterest record is created by the daily cron — or a
+  // manual "Generate Missing Interest Records" run — once that first
+  // due date actually arrives. Charging interest on the disbursal day
+  // itself would be wrong regardless of when it happened.
   await loan.populate({ path: 'borrower', select: 'name phone status' });
 
   return new ApiResponse(201, 'Loan created successfully', { loan }).send(res, 201);

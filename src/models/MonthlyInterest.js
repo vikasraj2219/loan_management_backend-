@@ -93,6 +93,14 @@ const monthlyInterestSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    // Free-text context for manually created/edited records — e.g. "data
+    // migration from old ledger" or "corrected after borrower dispute".
+    // Not used by any generated record.
+    remarks: {
+      type: String,
+      trim: true,
+      maxlength: [500, 'Remarks cannot exceed 500 characters'],
+    },
   },
   { timestamps: true }
 );

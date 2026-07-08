@@ -91,7 +91,7 @@ const exportExcel = catchAsync(async (req, res) => {
   const summary = summarize(payments);
 
   const workbook = new ExcelJS.Workbook();
-  workbook.creator = 'LoanFlow';
+  workbook.creator = 'Waghmare Vikas';
   workbook.created = new Date();
 
   const summarySheet = workbook.addWorksheet('Summary');
@@ -152,8 +152,9 @@ const exportPdf = catchAsync(async (req, res) => {
   const doc = new PDFDocument({ margin: 40, size: 'A4' });
   doc.pipe(res);
 
-  doc.fontSize(18).text('Collection Report', { align: 'left' });
-  doc.fontSize(9).fillColor('#666').text(`Generated on ${new Date().toLocaleString('en-IN')}`);
+  doc.fontSize(10).fillColor('#146C43').font('Helvetica-Bold').text('WAGHMARE VIKAS', { align: 'left' });
+  doc.fontSize(18).fillColor('#000').font('Helvetica-Bold').text('Collection Report', { align: 'left' });
+  doc.fontSize(9).font('Helvetica').fillColor('#666').text(`Generated on ${new Date().toLocaleString('en-IN')}`);
   doc.moveDown(1);
 
   doc.fillColor('#000').fontSize(11);
