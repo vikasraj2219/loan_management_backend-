@@ -48,13 +48,10 @@ const borrowerSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
-    documents: [
-      {
-        fileName: String,
-        filePath: String,
-        uploadedAt: { type: Date, default: Date.now },
-      },
-    ],
+    // KYC/other files live in the dedicated Document collection now (see
+    // models/Document.js) — full CRUD, replace, preview, download, search —
+    // rather than this fixed-shape embedded array, which only ever
+    // supported adding a file, never editing or removing one.
     notes: {
       type: String,
       maxlength: [1000, 'Notes cannot exceed 1000 characters'],

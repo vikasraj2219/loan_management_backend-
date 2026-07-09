@@ -13,8 +13,14 @@ app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', creden
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- Static files (uploaded documents) ---
-app.use('/uploads', express.static('uploads'));
+// NOTE: uploaded files are intentionally NOT served via express.static.
+// Every file (documents, receipts) has its own authenticated endpoint
+// (see /documents/download/:id and /documents/preview/:id) that streams
+// it from disk after checking the request's JWT — a blanket static mount
+// here would let anyone with a guessed/leaked fileUrl bypass that check
+// entirely, which violates the "protect download endpoints with
+// authentication" requirement. If a future feature needs public files
+// (e.g. a logo), mount a separate, clearly-scoped static path for it.
 
 // --- Request logging ---
 if (process.env.NODE_ENV !== 'test') {

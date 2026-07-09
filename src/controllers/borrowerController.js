@@ -108,34 +108,10 @@ const deleteBorrower = catchAsync(async (req, res) => {
   return new ApiResponse(200, 'Borrower deactivated successfully', { borrower }).send(res, 200);
 });
 
-/**
- * @desc  Upload KYC documents for a borrower
- * @route POST /api/v1/borrowers/:id/documents
- */
-const uploadDocuments = catchAsync(async (req, res) => {
-  const borrower = await Borrower.findById(req.params.id);
-  if (!borrower) throw ApiError.notFound('Borrower not found');
-
-  if (!req.files || req.files.length === 0) {
-    throw ApiError.badRequest('At least one document file is required');
-  }
-
-  const documents = req.files.map((file) => ({
-    fileName: file.originalname,
-    filePath: file.path.replace(/\\/g, '/'),
-  }));
-
-  borrower.documents.push(...documents);
-  await borrower.save();
-
-  return new ApiResponse(200, 'Documents uploaded successfully', { borrower }).send(res, 200);
-});
-
 module.exports = {
   createBorrower,
   getBorrowers,
   getBorrowerById,
   updateBorrower,
   deleteBorrower,
-  uploadDocuments,
 };

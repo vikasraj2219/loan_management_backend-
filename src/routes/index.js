@@ -8,6 +8,7 @@ const reportRoutes = require('./reportRoutes');
 const jobRoutes = require('./jobRoutes');
 const interestRoutes = require('./interestRoutes');
 const monthlyInterestRoutes = require('./monthlyInterestRoutes');
+const { globalRouter: documentGlobalRoutes } = require('./documentRoutes');
 
 const router = express.Router();
 
@@ -24,5 +25,6 @@ router.use('/reports', reportRoutes);
 router.use('/jobs', jobRoutes);
 router.use('/interest', interestRoutes);
 router.use('/interest-records', monthlyInterestRoutes);
+router.use('/documents', documentGlobalRoutes);
 
 module.exports = router;

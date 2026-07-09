@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math.** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (Phase 1 of 2).** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -289,8 +289,72 @@ Edge cases to verify:
 - Delete a record via `DELETE /interest-records/:id`, then check the loan and dashboard → both totals adjust immediately with no stale leftover
 - Attempt `POST /interest-records` with a `month`/`year` that already has a record for that loan → `409 Conflict`
 
+```bash
+# Upload two documents to a borrower
+curl -X POST http://localhost:5000/api/v1/borrowers/<borrowerId>/documents \
+  -H "Authorization: Bearer <accessToken>" \
+  -F "category=PAN Card" \
+  -F "files=@/path/to/pan.jpg" \
+  -F "files=@/path/to/pan-back.jpg"
+
+# List a loan's documents
+curl "http://localhost:5000/api/v1/loans/<loanId>/documents" \
+  -H "Authorization: Bearer <accessToken>"
+
+# Download (auth required — a plain browser link to fileUrl will not work, by design)
+curl "http://localhost:5000/api/v1/documents/download/<documentId>" \
+  -H "Authorization: Bearer <accessToken>" -o document.pdf
+
+# Search everything
+curl "http://localhost:5000/api/v1/documents?category=Loan%20Agreement&status=active" \
+  -H "Authorization: Bearer <accessToken>"
+```
+
+Edge cases to verify:
+- Upload a `.exe` (or rename one to `.pdf` and check the `Content-Type` your client sends — the server checks the actual MIME type, not the extension) → `400`
+- Upload a file over 20MB → Multer rejects it before it reaches the controller
+- Upload the same file (same name + size) to the same borrower twice → both succeed, but the second response has `duplicateWarning: true`
+- Upload via `/loans/:id/documents` → `GET /borrowers/:borrowerId/documents` for that loan's borrower also shows it (loan documents are borrower-stamped too)
+- Soft-delete a document, then `GET .../documents` (default, no `status` filter) → it no longer appears; `GET .../documents?status=archived` → it does
+- Permanent-delete as a non-admin → `403`; as an admin → the file is gone from disk and the record from the DB
+- Replace a file via `PUT .../documents/:id` with a new `file` field → same `_id`, new `fileUrl`/`fileSize`/etc., `updatedAt` changes, and the old physical file is deleted
+- Try `GET /uploads/documents/<any-filename>` directly (bypassing the API) → `404`, since nothing serves that path publicly anymore
+- `GET /dashboard/summary` → `totalDocuments`, `documentsUploadedToday`, `borrowerDocuments`, `loanDocuments`, `archivedDocuments` all reconcile with what you just created/archived above
+
+## Document Management (Phase 1 of 2)
+
+A dedicated, reusable module — not bolted onto Borrower/Loan — for uploading and managing files against either a borrower, a loan, or both.
+
+**Ownership model**: every `Document` belongs to a borrower, a loan, or both (enforced by a `pre('validate')` hook — never neither). Uploading through `/loans/:id/documents` automatically stamps the document with that loan's borrower too, so a borrower's own Documents view shows their KYC papers *and* every loan's paperwork in one place, while a loan's view stays strictly scoped to that loan. This is what "borrower documents are shared across all loans" and "loan documents belong only to the selected loan" mean in practice.
+
+**Storage is abstracted from day one.** Every filesystem call — building metadata from a Multer file, resolving a stored path, deleting a file — goes through `src/utils/fileStorage.js`. Nothing else in the app touches `fs`/`path` for documents directly. Migrating to S3/Cloudinary/Azure Blob later means rewriting that one file (and swapping the Multer storage engine in `documentUpload.js`) — the model, controller, routes, and frontend never change, since they only ever deal with the `fileUrl`/`filePath` strings this module hands back.
+
+**Security**: file type is allowlisted by MIME type (PDF, DOC/DOCX, XLS/XLSX, JPG, PNG, WEBP, ZIP) — an allowlist, not a blocklist, is what actually satisfies "prevent executable file uploads," since an `.exe` simply isn't on the list. 20MB per file. Filenames are sanitized and given a unique suffix on disk. **Uploaded files are never served publicly** — see the note in `app.js`; download and preview each go through their own authenticated endpoint that streams the file from disk after checking the request's JWT, rather than a blanket `express.static` mount that would let anyone with a guessed URL bypass auth entirely.
+
+**Delete is soft by default.** `DELETE .../documents/:id` archives the record (status → `archived`) and keeps the file. `?permanent=true` (admin only) removes both the DB record and the physical file. Either way, deleting a document never touches the owning borrower, loan, payment, or interest records.
+
+**Every mutating action is logged.** Upload, edit, replace, delete, and download all write an entry to the generic `ActivityLog` collection (`src/services/activityLogService.js`) — fire-and-forget, so a logging failure can never block the action it's describing.
+
+### API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET / POST | `/borrowers/:id/documents` | List (filtered/paginated) / upload one-or-more files (field `files`, up to 10 per request) |
+| GET / PUT / DELETE | `/borrowers/:id/documents/:documentId` | Get one / edit metadata (+ optional file replace via field `file`) / delete |
+| GET / POST | `/loans/:id/documents` | Same shape, scoped to a loan |
+| GET / PUT / DELETE | `/loans/:id/documents/:documentId` | Same shape, scoped to a loan |
+| GET | `/documents` , `/documents/search` | Cross-cutting list/search over every document (borrower/loan/category/status/fileType/date filters) |
+| GET | `/documents/download/:documentId` | Streams the original file as an attachment, preserving the original filename, and increments `downloadCount` |
+| GET | `/documents/preview/:documentId` | Streams the file inline (correct `Content-Type`) for a browser-native PDF viewer or `<img>` tag |
+| GET | `/documents/categories?type=borrower\|loan` | Suggested category list for the upload form's dropdown (category itself is free text, not a rigid enum) |
+
+All routes require authentication; permanent delete additionally requires the `admin` role.
+
+### What's in Phase 2
+Drag & drop upload with per-file progress bars, in-browser PDF/image preview (the blob-fetching groundwork is already in the frontend's `documentApi.js`), a tags input and grid-view toggle in the UI, a dedicated global Documents page with the full filter set the backend already supports, and surfacing `downloadCount` in the UI.
+
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, and Corrected Interest Math addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, transactional writes throughout, dashboard analytics, and exportable reports. Natural next steps for a v2 would be: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, and Document Management (Phase 1) addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Document Management Phase 2 (drag & drop, in-browser preview, tags/grid view, a global documents page) is the next planned addition — see that section above. Beyond that, natural v2 candidates: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT

@@ -11,6 +11,7 @@ const {
 const { createLoanRules, updateLoanRules, idParamRule } = require('../validators/loanValidator');
 const validate = require('../middlewares/validate');
 const { protect, authorize } = require('../middlewares/auth');
+const { createOwnerDocumentRouter } = require('./documentRoutes');
 
 const router = express.Router();
 
@@ -27,6 +28,10 @@ router
 
 // GET /loans/:id/interest - full month-by-month interest schedule + pending summary
 router.get('/:id/interest', idParamRule, validate, getLoanInterestSchedule);
+
+// /loans/:id/documents - full document CRUD (agreement, security papers,
+// receipts, etc.) via the dedicated Document module — see documentRoutes.js
+router.use('/:id/documents', createOwnerDocumentRouter('loan'));
 
 // PATCH /loans/:id/close - close a fully repaid loan
 router.patch('/:id/close', idParamRule, validate, closeLoan);

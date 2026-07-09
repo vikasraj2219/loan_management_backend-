@@ -4,6 +4,7 @@ const Borrower = require('../models/Borrower');
 const Loan = require('../models/Loan');
 const Payment = require('../models/Payment');
 const MonthlyInterest = require('../models/MonthlyInterest');
+const Document = require('../models/Document');
 
 const startOfDay = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 const startOfMonth = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), 1);
@@ -27,6 +28,7 @@ const getSummary = catchAsync(async (req, res) => {
     monthlyCollectionAgg,
     pendingInterestAgg,
     overdueInterestAgg,
+    documentStatsAgg,
   ] = await Promise.all([
     Borrower.countDocuments({ status: 'active' }),
     Loan.countDocuments({ status: 'active' }),
@@ -74,11 +76,38 @@ const getSummary = catchAsync(async (req, res) => {
         },
       },
     ]),
+    // Document stats — every count derived live from the Document
+    // collection, never hardcoded or cached.
+    Document.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalDocuments: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          archivedDocuments: { $sum: { $cond: [{ $eq: ['$status', 'archived'] }, 1, 0] } },
+          borrowerDocuments: {
+            $sum: { $cond: [{ $and: [{ $eq: ['$status', 'active'] }, { $ifNull: ['$borrower', false] }, { $eq: ['$loan', null] }] }, 1, 0] },
+          },
+          loanDocuments: {
+            $sum: { $cond: [{ $and: [{ $eq: ['$status', 'active'] }, { $ifNull: ['$loan', false] }] }, 1, 0] },
+          },
+          uploadedToday: {
+            $sum: { $cond: [{ $gte: ['$createdAt', todayStart] }, 1, 0] },
+          },
+        },
+      },
+    ]),
   ]);
 
   const aggregates = loanAggregates[0] || { totalAmountLent: 0, outstandingPrincipal: 0 };
   const pendingInterest = pendingInterestAgg[0] || { totalPendingInterest: 0, totalPendingMonths: 0, borrowers: [] };
   const overdueInterest = overdueInterestAgg[0] || { overdueInterestAmount: 0, loans: [] };
+  const documentStats = documentStatsAgg[0] || {
+    totalDocuments: 0,
+    archivedDocuments: 0,
+    borrowerDocuments: 0,
+    loanDocuments: 0,
+    uploadedToday: 0,
+  };
 
   return new ApiResponse(200, 'Dashboard summary fetched successfully', {
     totalBorrowers,
@@ -95,6 +124,12 @@ const getSummary = catchAsync(async (req, res) => {
     borrowersWithPendingInterest: pendingInterest.borrowers.length,
     overdueInterestAmount: Math.round(overdueInterest.overdueInterestAmount),
     loansWithOverdueInterest: overdueInterest.loans.length,
+    // Document statistics
+    totalDocuments: documentStats.totalDocuments,
+    documentsUploadedToday: documentStats.uploadedToday,
+    borrowerDocuments: documentStats.borrowerDocuments,
+    loanDocuments: documentStats.loanDocuments,
+    archivedDocuments: documentStats.archivedDocuments,
   }).send(res, 200);
 });
 
