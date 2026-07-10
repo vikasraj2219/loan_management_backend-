@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (Phase 1 of 2).** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (complete).** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -321,7 +321,7 @@ Edge cases to verify:
 - Try `GET /uploads/documents/<any-filename>` directly (bypassing the API) → `404`, since nothing serves that path publicly anymore
 - `GET /dashboard/summary` → `totalDocuments`, `documentsUploadedToday`, `borrowerDocuments`, `loanDocuments`, `archivedDocuments` all reconcile with what you just created/archived above
 
-## Document Management (Phase 1 of 2)
+## Document Management
 
 A dedicated, reusable module — not bolted onto Borrower/Loan — for uploading and managing files against either a borrower, a loan, or both.
 
@@ -350,11 +350,11 @@ A dedicated, reusable module — not bolted onto Borrower/Loan — for uploading
 
 All routes require authentication; permanent delete additionally requires the `admin` role.
 
-### What's in Phase 2
-Drag & drop upload with per-file progress bars, in-browser PDF/image preview (the blob-fetching groundwork is already in the frontend's `documentApi.js`), a tags input and grid-view toggle in the UI, a dedicated global Documents page with the full filter set the backend already supports, and surfacing `downloadCount` in the UI.
+### Frontend Phase 1 vs Phase 2
+The API surface above shipped complete from the start — `tags`, `downloadCount`, and the preview endpoint were never staged behind a later phase on the backend. What was actually phased was the *frontend*: Phase 1 shipped a working table view with upload/edit/download/delete; Phase 2 added drag & drop with per-file progress, in-browser PDF/image preview (using the preview endpoint above), a tags input, a grid-view toggle, and the dedicated global Documents page that exercises the `/documents` search filters this API already supported. Both phases talk to the exact same backend.
 
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, and Document Management (Phase 1) addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Document Management Phase 2 (drag & drop, in-browser preview, tags/grid view, a global documents page) is the next planned addition — see that section above. Beyond that, natural v2 candidates: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, and Document Management addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository (with preview, tags, and download tracking) shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Natural v2 candidates beyond this: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, cloud object storage for documents (the abstraction is already in place for it), and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT
