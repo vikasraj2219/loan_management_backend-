@@ -16,12 +16,16 @@ const createBorrower = catchAsync(async (req, res) => {
 });
 
 /**
- * @desc  List borrowers with search, filter, and pagination
+ * @desc  List borrowers with search, filter, and pagination. Always sorted
+ *        with pending-interest borrowers first — see the aggregation
+ *        pipeline below for the exact priority rules.
  * @route GET /api/v1/borrowers
- * Query params: page, limit, sort, search, status
+ * Query params: page, limit, search, status
+ * (No `sort` param: ordering is fixed by business rule, not user-selectable —
+ * see "Automatically Prioritize Borrowers with Pending Interest".)
  */
 const getBorrowers = catchAsync(async (req, res) => {
-  const { page, limit, skip, sort } = getPaginationParams(req.query);
+  const { page, limit, skip } = getPaginationParams(req.query);
   const filter = {};
 
   if (req.query.status) filter.status = req.query.status;
@@ -32,7 +36,36 @@ const getBorrowers = catchAsync(async (req, res) => {
   }
 
   const [borrowers, total] = await Promise.all([
-    Borrower.find(filter).sort(sort).skip(skip).limit(limit).lean(),
+    Borrower.aggregate([
+      { $match: filter },
+      // Pull in this borrower's still-unpaid MonthlyInterest records so we
+      // can rank by them without a separate round trip per borrower.
+      {
+        $lookup: {
+          from: 'monthlyinterests',
+          let: { borrowerId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $and: [{ $eq: ['$borrower', '$$borrowerId'] }, { $ne: ['$status', 'paid'] }] } } },
+            { $project: { pendingAmount: 1 } },
+          ],
+          as: 'pendingInterestRecords',
+        },
+      },
+      {
+        $addFields: {
+          pendingMonths: { $size: '$pendingInterestRecords' },
+          pendingInterestAmount: { $sum: '$pendingInterestRecords.pendingAmount' },
+        },
+      },
+      { $project: { pendingInterestRecords: 0 } },
+      // Sorting by pendingMonths descending already satisfies priorities
+      // 1 and 2 together (anyone with 0 pending months — i.e. no pending
+      // interest at all — naturally sinks below everyone who has some),
+      // then pendingInterestAmount breaks ties, then name alphabetically.
+      { $sort: { pendingMonths: -1, pendingInterestAmount: -1, name: 1 } },
+      { $skip: skip },
+      { $limit: limit },
+    ]),
     Borrower.countDocuments(filter),
   ]);
 

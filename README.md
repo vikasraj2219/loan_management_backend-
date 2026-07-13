@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (complete).** Auth, Borrowers, Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (complete) + Borrower List Prioritization.** Auth, Borrowers (now sorted by pending-interest urgency by default), Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -64,12 +64,14 @@ Base URL: `http://localhost:5000/api/v1`
 ### Borrowers
 | Method | Endpoint | Access | Description |
 |---|---|---|---|
-| GET | `/borrowers?search=&status=&page=&limit=` | Authenticated | List/search/filter/paginate |
+| GET | `/borrowers?search=&status=&page=&limit=` | Authenticated | List/search/filter/paginate — **always sorted with pending-interest borrowers first**, see below |
 | POST | `/borrowers` | Authenticated | Create borrower |
-| GET | `/borrowers/:id` | Authenticated | Get borrower + loans |
+| GET | `/borrowers/:id` | Authenticated | Get borrower + loans + live interest summary |
 | PATCH | `/borrowers/:id` | Authenticated | Update borrower |
 | DELETE | `/borrowers/:id` | Admin only | Deactivate (soft delete) |
-| POST | `/borrowers/:id/documents` | Authenticated | Upload KYC docs (multipart, field `documents`) |
+| GET / POST | `/borrowers/:id/documents` | Authenticated | List / upload documents (multipart, field `files`) — see [Document Management](#document-management) |
+
+**Borrower list ordering is fixed, not user-selectable.** `getBorrowers` no longer accepts a `sort` query param — it runs an aggregation that `$lookup`s each borrower's unpaid `MonthlyInterest` records, computes `pendingMonths` and `pendingInterestAmount` on the fly, and sorts by `{ pendingMonths: -1, pendingInterestAmount: -1, name: 1 }`. Sorting by `pendingMonths` descending alone already achieves the brief's full 4-tier priority (anyone with pending interest naturally sorts above anyone with none, ranked by how many months, then by how much), so it's one sort key doing the work of two priority rules. Both fields are returned on each borrower in the list response for the frontend's badges — nothing is cached, so the order and the numbers are always current as of the request.
 
 ### Loans
 | Method | Endpoint | Access | Description |
@@ -320,6 +322,7 @@ Edge cases to verify:
 - Replace a file via `PUT .../documents/:id` with a new `file` field → same `_id`, new `fileUrl`/`fileSize`/etc., `updatedAt` changes, and the old physical file is deleted
 - Try `GET /uploads/documents/<any-filename>` directly (bypassing the API) → `404`, since nothing serves that path publicly anymore
 - `GET /dashboard/summary` → `totalDocuments`, `documentsUploadedToday`, `borrowerDocuments`, `loanDocuments`, `archivedDocuments` all reconcile with what you just created/archived above
+- `GET /borrowers` with several borrowers in different pending-interest states → the response order matches `{pendingMonths desc, pendingInterestAmount desc, name asc}`, and each borrower object includes `pendingMonths`/`pendingInterestAmount`; pay off a borrower's last pending month and re-fetch → they drop out of the "has pending interest" group immediately, no caching involved
 
 ## Document Management
 
@@ -354,7 +357,7 @@ All routes require authentication; permanent delete additionally requires the `a
 The API surface above shipped complete from the start — `tags`, `downloadCount`, and the preview endpoint were never staged behind a later phase on the backend. What was actually phased was the *frontend*: Phase 1 shipped a working table view with upload/edit/download/delete; Phase 2 added drag & drop with per-file progress, in-browser PDF/image preview (using the preview endpoint above), a tags input, a grid-view toggle, and the dedicated global Documents page that exercises the `/documents` search filters this API already supported. Both phases talk to the exact same backend.
 
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, and Document Management addenda is implemented and wired end-to-end: borrower management, loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository (with preview, tags, and download tracking) shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Natural v2 candidates beyond this: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, cloud object storage for documents (the abstraction is already in place for it), and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, Document Management, and Borrower List Prioritization addenda is implemented and wired end-to-end: borrower management (now surfaced in pending-interest-urgency order automatically), loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository (with preview, tags, and download tracking) shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Natural v2 candidates beyond this: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, cloud object storage for documents (the abstraction is already in place for it), and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT
