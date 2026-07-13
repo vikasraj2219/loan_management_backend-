@@ -1,21 +1,10 @@
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const ApiError = require('../utils/ApiError');
 
-const uploadPath = process.env.UPLOAD_PATH || './uploads';
-
-if (!fs.existsSync(uploadPath)) {
-  fs.mkdirSync(uploadPath, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadPath),
-  filename: (req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${file.fieldname}-${unique}${path.extname(file.originalname)}`);
-  },
-});
+// Payment receipts, like documents, upload straight to Cloudinary — see
+// src/utils/fileStorage.js. memoryStorage means the file never touches
+// local disk; it's handed to Cloudinary as a buffer.
+const storage = multer.memoryStorage();
 
 const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
 

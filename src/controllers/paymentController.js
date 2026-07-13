@@ -6,6 +6,7 @@ const Loan = require('../models/Loan');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
 const { allocateInterestFifo } = require('../services/interestAllocationService');
 const withTransaction = require('../utils/withTransaction');
+const { uploadFile } = require('../utils/fileStorage');
 
 /**
  * @desc  Record a payment (principal and/or interest) against a loan.
@@ -161,10 +162,21 @@ const uploadReceipt = catchAsync(async (req, res) => {
   if (!payment) throw ApiError.notFound('Payment not found');
 
   if (!req.file) throw ApiError.badRequest('A receipt file is required');
+  if (req.file.size === 0) throw ApiError.badRequest('The uploaded file is empty (0 bytes)');
+
+  let meta;
+  try {
+    meta = await uploadFile(req.file, { category: 'Payment Receipt' });
+  } catch (err) {
+    throw ApiError.internal(`Failed to upload receipt to Cloudinary: ${err.message}`);
+  }
 
   payment.receiptFile = {
-    fileName: req.file.originalname,
-    filePath: req.file.path.replace(/\\/g, '/'),
+    fileName: meta.originalFileName,
+    storageProvider: 'cloudinary',
+    cloudinaryPublicId: meta.cloudinaryPublicId,
+    secureUrl: meta.secureUrl,
+    resourceType: meta.resourceType,
   };
   await payment.save();
 

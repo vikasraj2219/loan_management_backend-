@@ -9,15 +9,28 @@ const {
   getLoanDocumentById,
   updateBorrowerDocument,
   updateLoanDocument,
+  archiveBorrowerDocument,
+  archiveLoanDocument,
+  unarchiveBorrowerDocument,
+  unarchiveLoanDocument,
   deleteBorrowerDocument,
   deleteLoanDocument,
   getAllDocuments,
   searchDocuments,
+  bulkArchive,
+  bulkUnarchive,
+  bulkPermanentDelete,
   downloadDocument,
   previewDocument,
   getCategories,
 } = require('../controllers/documentController');
-const { uploadRules, updateRules, listQueryRules, documentIdParamRule } = require('../validators/documentValidator');
+const {
+  uploadRules,
+  updateRules,
+  listQueryRules,
+  documentIdParamRule,
+  bulkActionRules,
+} = require('../validators/documentValidator');
 const validate = require('../middlewares/validate');
 const { protect } = require('../middlewares/auth');
 
@@ -36,6 +49,8 @@ function createOwnerDocumentRouter(ownerField) {
   const listHandler = isLoan ? listLoanDocuments : listBorrowerDocuments;
   const getHandler = isLoan ? getLoanDocumentById : getBorrowerDocumentById;
   const updateHandler = isLoan ? updateLoanDocument : updateBorrowerDocument;
+  const archiveHandler = isLoan ? archiveLoanDocument : archiveBorrowerDocument;
+  const unarchiveHandler = isLoan ? unarchiveLoanDocument : unarchiveBorrowerDocument;
   const deleteHandler = isLoan ? deleteLoanDocument : deleteBorrowerDocument;
 
   // GET  /:id/documents        - list, filter, paginate
@@ -54,6 +69,11 @@ function createOwnerDocumentRouter(ownerField) {
     .put(documentUpload.single('file'), updateRules, validate, updateHandler)
     .delete(documentIdParamRule, validate, deleteHandler);
 
+  // PATCH /:id/documents/:documentId/archive   - hide from the default Active list, file untouched
+  // PATCH /:id/documents/:documentId/unarchive - restore to Active, nothing else changes
+  router.patch('/:documentId/archive', documentIdParamRule, validate, archiveHandler);
+  router.patch('/:documentId/unarchive', documentIdParamRule, validate, unarchiveHandler);
+
   return router;
 }
 
@@ -68,6 +88,15 @@ globalRouter.get('/categories', getCategories);
 globalRouter.get('/search', listQueryRules, validate, searchDocuments);
 globalRouter.get('/download/:documentId', documentIdParamRule, validate, downloadDocument);
 globalRouter.get('/preview/:documentId', documentIdParamRule, validate, previewDocument);
+
+// Bulk actions operate on a list of document ids directly (not owner-scoped)
+// since a selection can span multiple borrowers/loans — see bulkActionRules
+// for the { documentIds: [...] } body shape. Bulk permanent delete is
+// admin-only, same rule as the single-document version.
+globalRouter.post('/bulk/archive', bulkActionRules, validate, bulkArchive);
+globalRouter.post('/bulk/unarchive', bulkActionRules, validate, bulkUnarchive);
+globalRouter.post('/bulk/delete', bulkActionRules, validate, bulkPermanentDelete);
+
 globalRouter.get('/', listQueryRules, validate, getAllDocuments);
 
 module.exports = { createOwnerDocumentRouter, globalRouter };

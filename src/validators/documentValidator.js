@@ -25,10 +25,15 @@ const updateRules = [
 const listQueryRules = [
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 100 }),
-  query('status').optional().isIn(['active', 'archived']),
+  query('status').optional().isIn(['active', 'archived', 'all']),
   query('fileType').optional().isLength({ max: 20 }),
   query('dateFrom').optional().isISO8601(),
   query('dateTo').optional().isISO8601(),
 ];
 
-module.exports = { ownerIdParamRule, documentIdParamRule, uploadRules, updateRules, listQueryRules };
+const bulkActionRules = [
+  body('documentIds').isArray({ min: 1 }).withMessage('documentIds must be a non-empty array'),
+  body('documentIds.*').isMongoId().withMessage('Each documentId must be a valid id'),
+];
+
+module.exports = { ownerIdParamRule, documentIdParamRule, uploadRules, updateRules, listQueryRules, bulkActionRules };

@@ -54,9 +54,18 @@ const paymentSchema = new mongoose.Schema(
       trim: true,
       maxlength: [500, 'Remarks cannot exceed 500 characters'],
     },
+    // Uploaded to Cloudinary via the same fileStorage.js/cloudinaryService.js
+    // used by the Document module (see business rule: the Cloudinary
+    // integration is reusable across modules, not document-specific).
+    // fileName/filePath are kept for any receipt uploaded before this
+    // migration; new uploads populate the cloudinary* fields instead.
     receiptFile: {
       fileName: String,
       filePath: String,
+      storageProvider: { type: String, enum: ['cloudinary', 'local'] },
+      cloudinaryPublicId: String,
+      secureUrl: String,
+      resourceType: String,
     },
     // Audit trail of exactly which month(s) this payment's interestPaid was
     // applied to, in FIFO order (oldest unpaid month first — see

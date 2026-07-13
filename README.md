@@ -2,7 +2,7 @@
 
 A simple, clean REST API for the Loan & Interest Management System (Node.js + Express + MongoDB).
 
-> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management (complete) + Borrower List Prioritization.** Auth, Borrowers (now sorted by pending-interest urgency by default), Loans, Payments, per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure borrower/loan document repository, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
+> **Status: Phase 4 + Pending Monthly Interest Tracking + Manual Interest Backfill + Corrected Interest Math + Document Management on Cloudinary (Archive/Unarchive/Bulk) + Borrower List Prioritization.** Auth, Borrowers (sorted by pending-interest urgency by default), Loans, Payments (receipts on Cloudinary too), per-loan monthly interest automation with historically-accurate principal snapshots and FIFO payment allocation, on-demand backfill/recovery, full CRUD on individual interest records, a secure Cloudinary-backed document repository with archive/restore/bulk operations, Dashboard analytics, and Reports (PDF/Excel/CSV) are all live.
 
 ## Tech Stack
 - Node.js + Express
@@ -36,11 +36,15 @@ Config is read directly from `process.env` (loaded via `dotenv` in `server.js`) 
 ```bash
 cd loan-management-backend
 npm install
-cp .env.example .env   # edit JWT secrets + MONGO_URI
+cp .env.example .env   # edit JWT secrets + MONGO_URI + Cloudinary credentials
 npm run dev             # or: npm start
 ```
 
 API runs at `http://localhost:5000`.
+
+**Cloudinary setup** (required — document/receipt uploads fail without it): create a free account at [cloudinary.com](https://cloudinary.com), then copy the **Cloud Name**, **API Key**, and **API Secret** from your dashboard into `.env` as `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`. No further setup on Cloudinary's side is needed — folders (`loan-management/borrowers/`, etc.) are created automatically on first upload.
+
+If you have existing documents/receipts from before this migration, run `npm run migrate:cloudinary` once Cloudinary is configured — see [Document Management](#document-management) for details.
 
 Optional: seed a default admin user:
 ```bash
@@ -303,61 +307,87 @@ curl -X POST http://localhost:5000/api/v1/borrowers/<borrowerId>/documents \
 curl "http://localhost:5000/api/v1/loans/<loanId>/documents" \
   -H "Authorization: Bearer <accessToken>"
 
-# Download (auth required — a plain browser link to fileUrl will not work, by design)
-curl "http://localhost:5000/api/v1/documents/download/<documentId>" \
+# Download (auth required — redirects to a Cloudinary attachment URL)
+curl -L "http://localhost:5000/api/v1/documents/download/<documentId>" \
   -H "Authorization: Bearer <accessToken>" -o document.pdf
 
 # Search everything
 curl "http://localhost:5000/api/v1/documents?category=Loan%20Agreement&status=active" \
   -H "Authorization: Bearer <accessToken>"
+
+# Archive, then restore
+curl -X PATCH "http://localhost:5000/api/v1/borrowers/<borrowerId>/documents/<documentId>/archive" \
+  -H "Authorization: Bearer <accessToken>"
+curl -X PATCH "http://localhost:5000/api/v1/borrowers/<borrowerId>/documents/<documentId>/unarchive" \
+  -H "Authorization: Bearer <accessToken>"
+
+# Bulk archive
+curl -X POST http://localhost:5000/api/v1/documents/bulk/archive \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <accessToken>" \
+  -d '{"documentIds":["<id1>","<id2>"]}'
+
+# One-time migration of anything still on local disk
+npm run migrate:cloudinary
+npm run migrate:cloudinary -- --delete-local   # also removes the local files afterward
 ```
 
 Edge cases to verify:
 - Upload a `.exe` (or rename one to `.pdf` and check the `Content-Type` your client sends — the server checks the actual MIME type, not the extension) → `400`
 - Upload a file over 20MB → Multer rejects it before it reaches the controller
+- Upload a genuinely empty (0 byte) file → `400`, rejected before it reaches Cloudinary
 - Upload the same file (same name + size) to the same borrower twice → both succeed, but the second response has `duplicateWarning: true`
 - Upload via `/loans/:id/documents` → `GET /borrowers/:borrowerId/documents` for that loan's borrower also shows it (loan documents are borrower-stamped too)
-- Soft-delete a document, then `GET .../documents` (default, no `status` filter) → it no longer appears; `GET .../documents?status=archived` → it does
-- Permanent-delete as a non-admin → `403`; as an admin → the file is gone from disk and the record from the DB
-- Replace a file via `PUT .../documents/:id` with a new `file` field → same `_id`, new `fileUrl`/`fileSize`/etc., `updatedAt` changes, and the old physical file is deleted
-- Try `GET /uploads/documents/<any-filename>` directly (bypassing the API) → `404`, since nothing serves that path publicly anymore
+- Archive a document, then `GET .../documents` (default, no `status` param) → it no longer appears; `?status=archived` → it does; `?status=all` → both active and archived appear
+- Unarchive a document → it reappears in the default (Active) list; `unarchivedAt`/`unarchivedBy` are set, everything else (upload date, category, etc.) is untouched
+- Permanent-delete as a non-admin → `403`; as an admin → the Cloudinary asset and the DB record are both gone, nothing orphaned on either side
+- Bulk archive/unarchive/delete with a mix of valid and already-deleted ids → the valid ones succeed, the response's `failed` array explains the rest, and it's a `200` either way (partial success isn't an error)
+- Replace a file via `PUT .../documents/:id` with a new `file` field → same `_id`, new `cloudinaryPublicId`/`secureUrl`/`fileSize`, `updatedAt` changes, and the *old* Cloudinary asset is gone (check your Cloudinary media library)
+- Run `npm run migrate:cloudinary` against a database with no legacy documents → reports `0 found`, exits cleanly, changes nothing
 - `GET /dashboard/summary` → `totalDocuments`, `documentsUploadedToday`, `borrowerDocuments`, `loanDocuments`, `archivedDocuments` all reconcile with what you just created/archived above
 - `GET /borrowers` with several borrowers in different pending-interest states → the response order matches `{pendingMonths desc, pendingInterestAmount desc, name asc}`, and each borrower object includes `pendingMonths`/`pendingInterestAmount`; pay off a borrower's last pending month and re-fetch → they drop out of the "has pending interest" group immediately, no caching involved
 
 ## Document Management
 
-A dedicated, reusable module — not bolted onto Borrower/Loan — for uploading and managing files against either a borrower, a loan, or both.
+A dedicated, reusable module — not bolted onto Borrower/Loan — for uploading and managing files against either a borrower, a loan, or both. All new files live in **Cloudinary**; nothing new is written to local disk.
 
-**Ownership model**: every `Document` belongs to a borrower, a loan, or both (enforced by a `pre('validate')` hook — never neither). Uploading through `/loans/:id/documents` automatically stamps the document with that loan's borrower too, so a borrower's own Documents view shows their KYC papers *and* every loan's paperwork in one place, while a loan's view stays strictly scoped to that loan. This is what "borrower documents are shared across all loans" and "loan documents belong only to the selected loan" mean in practice.
+**Ownership model**: every `Document` belongs to a borrower, a loan, or both (enforced by a `pre('validate')` hook — never neither). Uploading through `/loans/:id/documents` automatically stamps the document with that loan's borrower too, so a borrower's own Documents view shows their KYC papers *and* every loan's paperwork in one place, while a loan's view stays strictly scoped to that loan.
 
-**Storage is abstracted from day one.** Every filesystem call — building metadata from a Multer file, resolving a stored path, deleting a file — goes through `src/utils/fileStorage.js`. Nothing else in the app touches `fs`/`path` for documents directly. Migrating to S3/Cloudinary/Azure Blob later means rewriting that one file (and swapping the Multer storage engine in `documentUpload.js`) — the model, controller, routes, and frontend never change, since they only ever deal with the `fileUrl`/`filePath` strings this module hands back.
+**Storage is abstracted from day one — this is what made the Cloudinary migration a two-file change.** Every upload/delete/URL call goes through `src/utils/fileStorage.js`, which itself delegates to `src/services/cloudinaryService.js` (the reusable Cloudinary wrapper — folder resolution, buffer upload, asset deletion, delivery-URL building). Nothing else in the app — not the model, not the controller's business logic, not the frontend — knows or cares that the storage backend changed. Payment receipt uploads (`paymentController.uploadReceipt`) reuse the exact same `fileStorage.uploadFile()` call, per the business rule that the Cloudinary integration should be reusable for other modules.
 
-**Security**: file type is allowlisted by MIME type (PDF, DOC/DOCX, XLS/XLSX, JPG, PNG, WEBP, ZIP) — an allowlist, not a blocklist, is what actually satisfies "prevent executable file uploads," since an `.exe` simply isn't on the list. 20MB per file. Filenames are sanitized and given a unique suffix on disk. **Uploaded files are never served publicly** — see the note in `app.js`; download and preview each go through their own authenticated endpoint that streams the file from disk after checking the request's JWT, rather than a blanket `express.static` mount that would let anyone with a guessed URL bypass auth entirely.
+**Folder structure**: uploads are routed into `loan-management/{borrowers,loans,receipts,agreements,identity-documents,other}/` based on keyword-matching the document's category (`cloudinaryService.resolveFolder`) — e.g. anything with "receipt" in its category goes to `receipts/`, "aadhaar"/"pan card"/"passport"/etc. go to `identity-documents/`, everything else falls back to the owner-type folder (`borrowers/` or `loans/`) or `other/`.
 
-**Delete is soft by default.** `DELETE .../documents/:id` archives the record (status → `archived`) and keeps the file. `?permanent=true` (admin only) removes both the DB record and the physical file. Either way, deleting a document never touches the owning borrower, loan, payment, or interest records.
+**Legacy documents keep working.** Anything uploaded before this migration has `storageProvider: 'local'` (or predates that field entirely) and a `filePath` — `fileStorage.js` branches on `storageProvider`/`cloudinaryPublicId` presence to fall back to streaming from disk for those, so nothing broke when the storage backend switched. `npm run migrate:cloudinary` (optionally `-- --delete-local` to clean up afterward) is a one-time, safely-re-runnable script that uploads every remaining local document *and* payment receipt to Cloudinary and updates its record — it only ever selects records still missing a `cloudinaryPublicId`, so re-running it is a no-op for anything already migrated.
 
-**Every mutating action is logged.** Upload, edit, replace, delete, and download all write an entry to the generic `ActivityLog` collection (`src/services/activityLogService.js`) — fire-and-forget, so a logging failure can never block the action it's describing.
+**Security**: file type is allowlisted by MIME type (PDF, DOC/DOCX, XLS/XLSX, JPG, PNG, WEBP, ZIP) — an allowlist, not a blocklist, is what actually satisfies "prevent executable file uploads." 20MB per file, 0-byte files explicitly rejected. Cloudinary credentials live only in `.env` (`CLOUDINARY_CLOUD_NAME`/`_API_KEY`/`_API_SECRET`) and are never sent to the frontend — the frontend never talks to Cloudinary directly, only to our own authenticated API. Download and preview both require a valid JWT to reach our endpoint at all; from there, Cloudinary documents get a 302 redirect to a Cloudinary URL (attachment-flagged for downloads, so the original filename survives), while legacy documents still stream from disk.
+
+**Archive is the default "delete."** Archiving (`PATCH .../archive`) never touches the Cloudinary asset — it only flips `status` and stamps `archivedAt`/`archivedBy`, and is fully reversible via `PATCH .../unarchive` (which stamps `unarchivedAt`/`unarchivedBy` and restores nothing else). The default document list (no `status` param) shows Active only; `?status=archived` or `?status=all` opt into seeing archived ones. **Permanent delete** (`?permanent=true` on the DELETE endpoint, or the dedicated bulk-delete route) is admin-only, removes the Cloudinary asset via its `public_id` *and* the DB record — there's never an orphaned Cloudinary file left behind, since the asset is only ever deleted alongside its record, never independently.
+
+**Replace** uploads the new file to Cloudinary first; only once that succeeds does the old asset (Cloudinary or legacy local) get deleted — a failed upload never leaves a document pointing at nothing.
+
+**Bulk operations** (`POST /documents/bulk/{archive,unarchive,delete}`, body `{ documentIds: [] }`) process each id independently, so one bad id in a batch of 50 doesn't abort the other 49 — the response reports exactly which ids succeeded and which failed and why. Bulk delete is admin-only, same as the single-document version.
+
+**Every mutating action is logged** to the generic `ActivityLog` collection (`src/services/activityLogService.js`) — upload, edit, replace, archive, unarchive, both delete flavors, download, and every bulk variant — fire-and-forget, so a logging failure can never block the action it's describing.
 
 ### API Reference
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET / POST | `/borrowers/:id/documents` | List (filtered/paginated) / upload one-or-more files (field `files`, up to 10 per request) |
-| GET / PUT / DELETE | `/borrowers/:id/documents/:documentId` | Get one / edit metadata (+ optional file replace via field `file`) / delete |
+| GET / POST | `/borrowers/:id/documents` | List (filtered/paginated, default Active only) / upload one-or-more files (field `files`, up to 10 per request) |
+| GET / PUT / DELETE | `/borrowers/:id/documents/:documentId` | Get one / edit metadata (+ optional file replace via field `file`) / delete (soft by default, `?permanent=true` admin-only) |
+| PATCH | `/borrowers/:id/documents/:documentId/archive` , `.../unarchive` | Archive / restore |
 | GET / POST | `/loans/:id/documents` | Same shape, scoped to a loan |
-| GET / PUT / DELETE | `/loans/:id/documents/:documentId` | Same shape, scoped to a loan |
-| GET | `/documents` , `/documents/search` | Cross-cutting list/search over every document (borrower/loan/category/status/fileType/date filters) |
-| GET | `/documents/download/:documentId` | Streams the original file as an attachment, preserving the original filename, and increments `downloadCount` |
-| GET | `/documents/preview/:documentId` | Streams the file inline (correct `Content-Type`) for a browser-native PDF viewer or `<img>` tag |
-| GET | `/documents/categories?type=borrower\|loan` | Suggested category list for the upload form's dropdown (category itself is free text, not a rigid enum) |
+| GET / PUT / DELETE / PATCH | `/loans/:id/documents/:documentId[/archive\|/unarchive]` | Same shape, scoped to a loan |
+| GET | `/documents` , `/documents/search` | Cross-cutting list/search over every document (borrower/loan/category/status/fileType/date filters; `status=active\|archived\|all`) |
+| GET | `/documents/download/:documentId` | Redirects to a Cloudinary attachment URL (or streams legacy local files), preserving the original filename, and increments `downloadCount` |
+| GET | `/documents/preview/:documentId` | Redirects to a Cloudinary inline URL (or streams legacy local files) for a browser-native PDF viewer or `<img>` tag |
+| GET | `/documents/categories?type=borrower\|loan` | Suggested category list for the upload form's dropdown (free text, not a rigid enum) |
+| POST | `/documents/bulk/archive` , `/bulk/unarchive` , `/bulk/delete` | Bulk operations, body `{ documentIds: [] }`; `/bulk/delete` is admin-only |
 
-All routes require authentication; permanent delete additionally requires the `admin` role.
-
-### Frontend Phase 1 vs Phase 2
-The API surface above shipped complete from the start — `tags`, `downloadCount`, and the preview endpoint were never staged behind a later phase on the backend. What was actually phased was the *frontend*: Phase 1 shipped a working table view with upload/edit/download/delete; Phase 2 added drag & drop with per-file progress, in-browser PDF/image preview (using the preview endpoint above), a tags input, a grid-view toggle, and the dedicated global Documents page that exercises the `/documents` search filters this API already supported. Both phases talk to the exact same backend.
+All routes require authentication; permanent delete (single or bulk) additionally requires the `admin` role.
 
 ## This System Is Feature-Complete for a v1
-Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, Document Management, and Borrower List Prioritization addenda is implemented and wired end-to-end: borrower management (now surfaced in pending-interest-urgency order automatically), loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure document repository (with preview, tags, and download tracking) shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Natural v2 candidates beyond this: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, cloud object storage for documents (the abstraction is already in place for it), and role-based UI beyond admin/staff (e.g. read-only auditor).
+Every feature in the original brief plus the Pending Monthly Interest Tracking, Manual Interest Backfill, Corrected Interest Math, Document Management (now on Cloudinary, with archive/restore and bulk operations), and Borrower List Prioritization addenda is implemented and wired end-to-end: borrower management (surfaced in pending-interest-urgency order automatically), loan creation with principal/interest tracking, partial repayments with a permanent audit trail, monthly interest generation that only fires after a completed billing cycle and is computed from the historically-accurate principal at each due date, FIFO interest payment allocation, on-demand backfill for pre-existing data, full CRUD on individual interest records for exceptional cases, a secure Cloudinary-backed document repository (with preview, tags, download tracking, and reversible archiving) shared correctly between borrowers and loans, transactional writes throughout, dashboard analytics, and exportable reports. Natural v2 candidates beyond this: refresh-token rotation/blacklisting, a notifications/reminders system for upcoming due dates, multi-currency support, Cloudinary's signed/expiring-URL delivery mode for stricter access control than the current redirect-after-auth approach, and role-based UI beyond admin/staff (e.g. read-only auditor).
 
 ## License
 MIT

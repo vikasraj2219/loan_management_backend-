@@ -7,10 +7,15 @@ const mongoose = require('mongoose');
  * across every loan that borrower has; Loan documents (agreement,
  * security papers, receipts) belong to one loan only.
  *
- * The physical file lives on disk (see src/utils/fileStorage.js), but
- * every path in this schema is resolved through that one small module —
- * not scattered path.join calls — so swapping to S3/Cloudinary later only
- * means changing fileStorage.js, not this model or its controller.
+ * Storage: every new file lives in Cloudinary (see src/utils/fileStorage.js
+ * and src/services/cloudinaryService.js) — nothing new is written to local
+ * disk. Documents uploaded before this migration keep their legacy
+ * `filePath`/`fileUrl` and `storageProvider: 'local'`, and continue to work
+ * via fileStorage.js's local-fallback branch until `npm run
+ * migrate:cloudinary` moves them over. Every path/URL in this schema is
+ * still resolved through that one module, not scattered calls — so a
+ * future move to S3 or Azure Blob would again mean changing one file, not
+ * this model or its controller.
  */
 const documentSchema = new mongoose.Schema(
   {
@@ -50,13 +55,35 @@ const documentSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // Legacy local-storage fields — optional now. Populated for documents
+    // uploaded before the Cloudinary migration; new uploads leave these
+    // unset (storageProvider is 'cloudinary' instead). Kept, not removed,
+    // so pre-migration documents keep working via fileStorage.js's
+    // local-fallback branch until `npm run migrate:cloudinary` runs.
     filePath: {
       type: String,
-      required: true,
     },
     fileUrl: {
       type: String,
-      required: true,
+    },
+    // Cloudinary fields — populated for every new upload.
+    storageProvider: {
+      type: String,
+      enum: ['cloudinary', 'local'],
+      default: 'cloudinary',
+    },
+    cloudinaryPublicId: {
+      type: String,
+    },
+    secureUrl: {
+      type: String,
+    },
+    resourceType: {
+      type: String,
+      enum: ['image', 'raw', 'video'],
+    },
+    folder: {
+      type: String,
     },
     mimeType: {
       type: String,
@@ -88,6 +115,23 @@ const documentSchema = new mongoose.Schema(
       enum: ['active', 'archived'],
       default: 'active',
       index: true,
+    },
+    // Archive lifecycle audit trail — who archived/restored a document and
+    // when, distinct from the generic ActivityLog so the document's own
+    // record is self-explanatory without a join.
+    archivedAt: {
+      type: Date,
+    },
+    archivedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    unarchivedAt: {
+      type: Date,
+    },
+    unarchivedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
     },
     downloadCount: {
       type: Number,
