@@ -54,15 +54,33 @@ const getLoans = catchAsync(async (req, res) => {
     if (req.query.maxRate) filter.interestRate.$lte = Number(req.query.maxRate);
   }
 
-  const [loans, total] = await Promise.all([
+  const [rawLoans, total] = await Promise.all([
     Loan.find(filter)
       .populate({ path: 'borrower', select: 'name phone status' })
       .sort(sort)
       .skip(skip)
       .limit(limit)
-      .lean({ virtuals: true }),
+      .lean(),
     Loan.countDocuments(filter),
   ]);
+
+  // `.lean({ virtuals: true })` silently does nothing without the
+  // mongoose-lean-virtuals plugin (not installed here) — plain Mongoose
+  // `.lean()` always strips virtuals regardless of that option. That left
+  // currentMonthlyInterest/pendingInterest/totalOutstanding undefined on
+  // every loan in this list, which the frontend was rendering as ₹0.
+  // Recompute them here with the exact same formulas as the schema's
+  // virtuals (see loanSchema.virtual(...) in models/Loan.js) so the list
+  // matches what GET /loans/:id already returns.
+  const loans = rawLoans.map((loan) => {
+    const pendingInterest = Math.max((loan.totalInterestAccrued || 0) - (loan.totalInterestPaid || 0), 0);
+    return {
+      ...loan,
+      currentMonthlyInterest: Math.round((loan.principalOutstanding * loan.interestRate) / 100),
+      pendingInterest,
+      totalOutstanding: loan.principalOutstanding + pendingInterest,
+    };
+  });
 
   return new ApiResponse(200, 'Loans fetched successfully', { loans }, buildPaginationMeta({ total, page, limit })).send(res, 200);
 });
