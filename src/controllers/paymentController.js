@@ -5,8 +5,20 @@ const Payment = require('../models/Payment');
 const Loan = require('../models/Loan');
 const { getPaginationParams, buildPaginationMeta } = require('../utils/paginate');
 const { allocateInterestFifo } = require('../services/interestAllocationService');
+const { reversePaymentEffects, recalculateLastPaymentDate } = require('../services/paymentAdjustmentService');
+const { logActivity } = require('../services/activityLogService');
 const withTransaction = require('../utils/withTransaction');
 const { uploadFile } = require('../utils/fileStorage');
+
+/** Snapshot of a payment's editable fields, used for the before/after audit trail on edit. */
+const snapshotPayment = (payment) => ({
+  paymentDate: payment.paymentDate,
+  principalPaid: payment.principalPaid,
+  interestPaid: payment.interestPaid,
+  paymentMode: payment.paymentMode,
+  referenceNumber: payment.referenceNumber,
+  remarks: payment.remarks,
+});
 
 /**
  * @desc  Record a payment (principal and/or interest) against a loan.
@@ -75,6 +87,14 @@ const createPayment = catchAsync(async (req, res) => {
     return created;
   });
 
+  await logActivity({
+    action: 'payment.create',
+    entityType: 'Payment',
+    entityId: payment._id,
+    performedBy: req.user._id,
+    metadata: { updated: snapshotPayment(payment) },
+  });
+
   await payment.populate([
     { path: 'loan', select: 'loanAmount principalOutstanding interestRate status' },
     { path: 'borrower', select: 'name phone' },
@@ -135,22 +155,139 @@ const getPaymentById = catchAsync(async (req, res) => {
 });
 
 /**
- * @desc  Update non-financial metadata only (mode, reference, remarks).
- *        principalPaid / interestPaid — and which months they cleared —
- *        are permanent once recorded.
+ * @desc  Edit a payment — date, principal/interest amounts, mode,
+ *        reference number, or remarks. Admin only.
+ *
+ *        Amount/date edits are implemented as reverse-then-reapply: the
+ *        payment's old effect on the loan and on every MonthlyInterest
+ *        record it touched is fully undone (as if it had never been
+ *        recorded), the new principal is validated against the
+ *        now-reversed outstanding balance, and the new interest amount is
+ *        re-run through the same FIFO allocation createPayment uses. This
+ *        keeps edit and create sharing one allocation rule, and means a
+ *        payment that used to clear 3 months but now clears 2 correctly
+ *        frees the 3rd month back to pending — never a stale allocation.
  * @route PATCH /api/v1/payments/:id
  */
 const updatePayment = catchAsync(async (req, res) => {
-  const allowedFields = ['paymentMode', 'referenceNumber', 'remarks'];
-  const updates = {};
-  allowedFields.forEach((field) => {
-    if (req.body[field] !== undefined) updates[field] = req.body[field];
+  const existing = await Payment.findById(req.params.id);
+  if (!existing) throw ApiError.notFound('Payment not found');
+
+  const loanForValidation = await Loan.findById(existing.loan);
+  if (!loanForValidation) throw ApiError.notFound('Loan not found for this payment');
+
+  const previousValues = snapshotPayment(existing);
+
+  const nextPaymentDate = req.body.paymentDate !== undefined ? new Date(req.body.paymentDate) : existing.paymentDate;
+  const nextPrincipalPaid = req.body.principalPaid !== undefined ? Number(req.body.principalPaid) : existing.principalPaid;
+  const nextInterestPaid = req.body.interestPaid !== undefined ? Number(req.body.interestPaid) : existing.interestPaid;
+  const nextPaymentMode = req.body.paymentMode !== undefined ? req.body.paymentMode : existing.paymentMode;
+  const nextReferenceNumber = req.body.referenceNumber !== undefined ? req.body.referenceNumber : existing.referenceNumber;
+  const nextRemarks = req.body.remarks !== undefined ? req.body.remarks : existing.remarks;
+
+  if (nextPrincipalPaid <= 0 && nextInterestPaid <= 0) {
+    throw ApiError.badRequest('At least one of principalPaid or interestPaid must be greater than 0');
+  }
+  if (nextPaymentDate < loanForValidation.loanDate) {
+    throw ApiError.badRequest('Payment date cannot be before the loan issue date');
+  }
+
+  const { payment: updated, loan } = await withTransaction(async (session) => {
+    const loanDoc = await Loan.findById(existing.loan).session(session || null);
+    if (!loanDoc) throw ApiError.notFound('Loan not found for this payment');
+
+    // Step 1: undo everything this payment did, as if it never existed —
+    // frees up both the principal it covered and whichever months its
+    // interest was allocated to.
+    await reversePaymentEffects(existing, loanDoc, session);
+
+    // Step 2: validate the new principal against the now-reversed balance.
+    if (nextPrincipalPaid > loanDoc.principalOutstanding) {
+      throw ApiError.badRequest(
+        `Principal paid (${nextPrincipalPaid}) cannot exceed the outstanding principal (${loanDoc.principalOutstanding})`
+      );
+    }
+
+    // Step 3: re-allocate the new interest amount FIFO against whatever is
+    // pending now (this payment's own months included, since step 1 freed
+    // them back up first).
+    const allocationResult = await allocateInterestFifo(loanDoc._id, nextInterestPaid, nextPaymentDate, session);
+
+    const newOutstanding = loanDoc.principalOutstanding - nextPrincipalPaid;
+
+    existing.paymentDate = nextPaymentDate;
+    existing.principalPaid = nextPrincipalPaid;
+    existing.interestPaid = nextInterestPaid;
+    existing.paymentMode = nextPaymentMode;
+    existing.referenceNumber = nextReferenceNumber;
+    existing.remarks = nextRemarks;
+    existing.principalOutstandingAfter = newOutstanding;
+    existing.interestAllocations = allocationResult.allocations;
+    existing.unallocatedInterest = allocationResult.unallocated;
+    await existing.save({ session });
+
+    loanDoc.principalOutstanding = newOutstanding;
+    loanDoc.totalPrincipalPaid += nextPrincipalPaid;
+    loanDoc.totalInterestPaid += nextInterestPaid;
+    loanDoc.lastPaymentDate = await recalculateLastPaymentDate(loanDoc._id, session);
+    await loanDoc.save({ session });
+
+    return { payment: existing, loan: loanDoc };
   });
 
-  const payment = await Payment.findByIdAndUpdate(req.params.id, updates, { new: true, runValidators: true });
-  if (!payment) throw ApiError.notFound('Payment not found');
+  await logActivity({
+    action: 'payment.update',
+    entityType: 'Payment',
+    entityId: updated._id,
+    performedBy: req.user._id,
+    metadata: { previous: previousValues, updated: snapshotPayment(updated) },
+  });
 
-  return new ApiResponse(200, 'Payment updated successfully', { payment }).send(res, 200);
+  await updated.populate([
+    { path: 'loan', select: 'loanAmount principalOutstanding interestRate status' },
+    { path: 'borrower', select: 'name phone' },
+  ]);
+
+  return new ApiResponse(200, 'Payment updated successfully', { payment: updated, loan }).send(res, 200);
+});
+
+/**
+ * @desc  Permanently delete a payment — admin only. Reverses its effect on
+ *        the loan (principalOutstanding, totals, lastPaymentDate) and on
+ *        every MonthlyInterest record it touched, so the loan ends up
+ *        exactly as if this payment had never been recorded. Unlike
+ *        MonthlyInterest records, payments have no independent value once
+ *        removed, so this is a hard delete, not an archive.
+ * @route DELETE /api/v1/payments/:id
+ */
+const deletePayment = catchAsync(async (req, res) => {
+  const existing = await Payment.findById(req.params.id);
+  if (!existing) throw ApiError.notFound('Payment not found');
+
+  const previousValues = snapshotPayment(existing);
+
+  const loan = await withTransaction(async (session) => {
+    const loanDoc = await Loan.findById(existing.loan).session(session || null);
+    if (!loanDoc) throw ApiError.notFound('Loan not found for this payment');
+
+    await reversePaymentEffects(existing, loanDoc, session);
+    loanDoc.lastPaymentDate = await recalculateLastPaymentDate(loanDoc._id, session, existing._id);
+    await loanDoc.save({ session });
+
+    await Payment.deleteOne({ _id: existing._id }, { session });
+
+    return loanDoc;
+  });
+
+  await logActivity({
+    action: 'payment.delete',
+    entityType: 'Payment',
+    entityId: existing._id,
+    performedBy: req.user._id,
+    metadata: { previous: previousValues },
+  });
+
+  return new ApiResponse(200, 'Payment deleted successfully', { deletedId: existing._id, loan }).send(res, 200);
 });
 
 /**
@@ -183,4 +320,4 @@ const uploadReceipt = catchAsync(async (req, res) => {
   return new ApiResponse(200, 'Receipt uploaded successfully', { payment }).send(res, 200);
 });
 
-module.exports = { createPayment, getPayments, getPaymentById, updatePayment, uploadReceipt };
+module.exports = { createPayment, getPayments, getPaymentById, updatePayment, deletePayment, uploadReceipt };

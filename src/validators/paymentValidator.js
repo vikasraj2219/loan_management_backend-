@@ -20,11 +20,12 @@ const createPaymentRules = [
 
 const updatePaymentRules = [
   param('id').isMongoId().withMessage('Invalid payment id'),
+  body('paymentDate').optional().isISO8601().withMessage('Payment date must be a valid date'),
+  body('principalPaid').optional().isFloat({ min: 0 }).withMessage('Principal paid must be 0 or greater'),
+  body('interestPaid').optional().isFloat({ min: 0 }).withMessage('Interest paid must be 0 or greater'),
   body('paymentMode').optional().isIn(['cash', 'bank_transfer', 'upi', 'cheque', 'other']),
   body('referenceNumber').optional().isLength({ max: 100 }),
   body('remarks').optional().isLength({ max: 500 }),
-  // principalPaid / interestPaid are intentionally not editable — payments
-  // are permanent ledger entries (see Payment model comment).
 ];
 
 const idParamRule = [param('id').isMongoId().withMessage('Invalid payment id')];

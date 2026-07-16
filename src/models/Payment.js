@@ -1,12 +1,15 @@
 const mongoose = require('mongoose');
 
 /**
- * A Payment is a permanent, immutable ledger entry. Once recorded, its
- * financial fields (principalPaid, interestPaid) are never edited or
- * deleted — this is what lets Loan.principalOutstanding, totalPrincipalPaid
- * and totalInterestPaid be trusted as a running total instead of a
- * recalculated guess. Only non-financial metadata (remarks, reference
- * number, payment mode, receipt) can be corrected after the fact.
+ * A Payment is a ledger entry. By default it's a running total the rest of
+ * the app trusts without recalculating — but an admin can edit (date,
+ * amounts, mode, reference, remarks) or permanently delete one to correct
+ * a mistake. Both operations go through paymentAdjustmentService's
+ * reverse-then-reapply flow (see paymentController.updatePayment /
+ * deletePayment) so Loan.principalOutstanding/totalPrincipalPaid/
+ * totalInterestPaid and every MonthlyInterest record this payment's
+ * interest was allocated to stay in sync — the loan ends up exactly as if
+ * the edit/delete had been true from the start.
  */
 const paymentSchema = new mongoose.Schema(
   {

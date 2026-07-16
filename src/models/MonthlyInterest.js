@@ -52,8 +52,10 @@ const monthlyInterestSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
-    // Only ever incremented by FIFO payment allocation — never decremented,
-    // never reset. pendingAmount and status are derived from this.
+    // Incremented by FIFO payment allocation; decremented only when a
+    // payment that had allocated against this record is edited or deleted
+    // (see paymentAdjustmentService.reversePaymentEffects). pendingAmount
+    // and status are always derived from this, never set directly.
     paidAmount: {
       type: Number,
       default: 0,
